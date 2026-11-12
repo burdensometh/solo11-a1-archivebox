@@ -1,0 +1,1230 @@
+import hashlib
+import logging
+import os
+import re
+from html import unescape
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
+
+from django import template
+from django.utils import timezone
+from django.utils.html import escape, format_html
+from django.utils.safestring import mark_safe
+from django.utils.text import Truncator
+
+from archivebox.config import CONSTANTS
+from archivebox.misc.logging_util import printable_filesize
+from archivebox.core.routes_util import (
+    build_snapshot_detail_url,
+    build_snapshot_files_url,
+    build_snapshot_role_output_url,
+    build_snapshot_url,
+    build_snapshot_zip_url,
+    get_admin_base_url,
+    get_snapshot_base_url,
+    get_web_base_url,
+)
+from archivebox.core.setup_wizard import get_base_url_mismatch_context, get_setup_wizard_context
+from archivebox.plugins.discovery import (
+    get_plugin_catalog,
+    get_plugin_icon,
+    get_plugin_icon_sprite,
+    get_plugin_name,
+    get_plugin_template,
+    plugin_card_is_interactive,
+    plugin_has_custom_full_response,
+)
+
+register = template.Library()
+register.filter("plugin_card_is_interactive", plugin_card_is_interactive)
+
+
+@register.filter
+def plugin_has_full_preview(result) -> bool:
+    """Match the generic preview route's installed full-template selection."""
+    if not result or result.status != "succeeded":
+        return False
+    plugin = get_plugin_name(result.plugin)
+    return bool(get_plugin_template(plugin, "full", fallback=False)) and not plugin_has_custom_full_response(plugin)
+
+
+# Preview cards are clipped windows onto their content, never scroll areas.
+# Apply inside the document too: parent overflow cannot constrain an iframe.
+CARD_OVERFLOW_STYLE = (
+    "<style>html,body{height:100%!important;min-height:0!important}"
+    "html,body,body *{overflow:clip!important;scrollbar-width:none!important}</style>"
+)
+
+
+@register.filter
+def snapshot_url_text(url):
+    """Emphasize the hostname while preserving the exact selectable URL."""
+    url = str(url or "")
+    match = re.match(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//([^/?#]*)", url)
+    if not match:
+        return escape(url)
+    netloc = match[1]
+    authority = netloc.rsplit("@", 1)[-1]
+    start = match.start(1) + len(netloc) - len(authority)
+    host_end = authority.find("]") + 1 if authority.startswith("[") else authority.find(":")
+    hostname = authority[:host_end] if host_end > 0 else authority
+    if hostname.lower().startswith("www."):
+        start += 4
+        hostname = hostname[4:]
+    remainder = url[start + len(hostname) :]
+    suffix = re.search(r"[?&#]", remainder)
+    suffix_start = suffix.start() if suffix else len(remainder)
+    return format_html(
+        '<span class="snapshot-url-prefix">{}</span><span class="snapshot-url-domain">{}</span>'
+        '<span class="snapshot-url-path">{}</span><span class="snapshot-url-suffix">{}</span>',
+        url[:start],
+        hostname,
+        remainder[:suffix_start],
+        remainder[suffix_start:],
+    )
+
+
+@register.simple_tag(takes_context=True)
+def plugin_ui(context, plugin: str, slot: str):
+    """Optional plugin UI must never prevent the host page from rendering."""
+    try:
+        source = get_plugin_template(plugin, slot, fallback=False)
+        if not source:
+            return ""
+        return template.engines["django"].from_string(source).render(context.flatten())
+    except Exception:
+        logging.getLogger(__name__).exception("Unable to render optional plugin UI: %s/%s", plugin, slot)
+        return ""
+
+
+_TEXT_PREVIEW_EXTS = (".json", ".jsonl", ".txt", ".csv", ".tsv", ".xml", ".yml", ".yaml", ".md", ".log")
+_IMAGE_PREVIEW_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".avif")
+_STATIC_URL_SAFE = "/@-._~!$&'()*+,;="
+
+_VIDEO_FILE_EXTS = {
+    ".mp4",
+    ".webm",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".flv",
+    ".wmv",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".ts",
+    ".m2ts",
+    ".mts",
+    ".3gp",
+    ".3g2",
+    ".ogv",
+}
+
+_AUDIO_FILE_EXTS = {
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".wav",
+    ".flac",
+    ".alac",
+    ".aiff",
+    ".wma",
+    ".mka",
+    ".ac3",
+    ".eac3",
+    ".dts",
+}
+
+_MEDIA_FILE_EXTS = _VIDEO_FILE_EXTS | _AUDIO_FILE_EXTS
+_BROWSER_VIDEO_FILE_EXTS = {".mp4", ".webm", ".m4v", ".ogv"}
+_BROWSER_AUDIO_FILE_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac"}
+
+
+def _is_web_subdomain_alias(browser_url: str, configured_base_url: str) -> bool:
+    """Hide the informational mismatch banner on the conventional public web alias.
+
+    This is deliberately presentation-only: request routing and the restriction
+    on state-changing requests continue to use the configured BASE_URL.
+    """
+    browser = urlparse(browser_url)
+    configured = urlparse(configured_base_url)
+    return (
+        browser.scheme.lower() == configured.scheme.lower()
+        and browser.hostname == f"web.{configured.hostname}"
+        and browser.port == configured.port
+    )
+
+
+def _normalize_output_files(output_files: Any) -> dict[str, dict[str, Any]]:
+    from abx_dl.output_files import OutputManifest
+
+    return OutputManifest.from_value(output_files).as_mapping()
+
+
+def _snapshot_id(value: Any) -> Any:
+    from archivebox.core.models import Snapshot
+
+    return value.id if isinstance(value, Snapshot) else value
+
+
+def _coerce_output_file_size(value: Any) -> int | None:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _count_media_files(result) -> int:
+    try:
+        output_files = _normalize_output_files(result.output_files or {})
+    except (AttributeError, TypeError, ValueError):
+        output_files = {}
+
+    if output_files:
+        return sum(1 for path in output_files if Path(path).suffix.lower() in _MEDIA_FILE_EXTS)
+
+    try:
+        plugin_dir = Path(result.snapshot_dir) / result.plugin
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+    if not plugin_dir.exists():
+        return 0
+
+    count = 0
+    scanned = 0
+    max_scan = 500
+    for file_path in plugin_dir.rglob("*"):
+        if scanned >= max_scan:
+            break
+        scanned += 1
+        if not file_path.is_file():
+            continue
+        if file_path.suffix.lower() in _MEDIA_FILE_EXTS:
+            count += 1
+    return count
+
+
+def _list_media_files(result, *, include_filesystem_fallback=True) -> list[dict]:
+    media_files: list[dict] = []
+    try:
+        plugin_dir = Path(result.snapshot_dir) / result.plugin if include_filesystem_fallback else None
+    except (AttributeError, TypeError, ValueError):
+        return media_files
+
+    output_files = _normalize_output_files(result.output_files or {})
+    candidates: list[tuple[Path, int | None]] = []
+    if output_files:
+        for path, metadata in output_files.items():
+            rel_path = Path(path)
+            if rel_path.suffix.lower() in _MEDIA_FILE_EXTS:
+                candidates.append((rel_path, _coerce_output_file_size(metadata.get("size"))))
+
+    if not candidates and plugin_dir is not None and plugin_dir.exists():
+        scanned = 0
+        max_scan = 2000
+        for file_path in plugin_dir.rglob("*"):
+            if scanned >= max_scan:
+                break
+            scanned += 1
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() in _MEDIA_FILE_EXTS:
+                try:
+                    rel_path = file_path.relative_to(plugin_dir)
+                except ValueError:
+                    continue
+                try:
+                    size = file_path.stat().st_size
+                except OSError:
+                    size = None
+                candidates.append((rel_path, size))
+
+    for rel_path, size in candidates:
+        if callable(getattr(result, "output_file_path", None)):
+            href = result.output_file_path(str(rel_path), output_file_map=output_files)
+        else:
+            metadata = output_files.get(str(rel_path)) or {}
+            href = str(rel_path) if metadata.get("root_relative") else str(Path(result.plugin) / rel_path)
+        if not href:
+            continue
+        suffix = rel_path.suffix.lower()
+        media_type = "video" if suffix in _VIDEO_FILE_EXTS else "audio"
+        media_files.append(
+            {
+                "name": rel_path.name,
+                "path": href,
+                "size": size,
+                "media_type": media_type,
+                "is_video": media_type == "video",
+                "is_audio": media_type == "audio",
+                "is_browser_playable": suffix in _BROWSER_VIDEO_FILE_EXTS or suffix in _BROWSER_AUDIO_FILE_EXTS,
+            },
+        )
+
+    media_files.sort(
+        key=lambda item: (
+            0 if item["is_video"] and item["is_browser_playable"] else 1 if item["is_audio"] and item["is_browser_playable"] else 2,
+            -int(item.get("size") or 0),
+            item["name"].lower(),
+        ),
+    )
+    return media_files
+
+
+def _resolve_snapshot_output_file(snapshot_dir: str | Path | None, raw_output_path: str | None) -> Path | None:
+    if not snapshot_dir or not raw_output_path or str(raw_output_path).strip() in (".", "/", "./"):
+        return None
+
+    output_file = Path(raw_output_path)
+    if not output_file.is_absolute():
+        output_file = Path(snapshot_dir) / raw_output_path
+
+    try:
+        output_file = output_file.resolve()
+        snap_dir = Path(snapshot_dir).resolve()
+        if snap_dir not in output_file.parents and output_file != snap_dir:
+            return None
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+    if output_file.exists() and output_file.is_file():
+        return output_file
+    return None
+
+
+def _is_text_preview_path(raw_output_path: str | None) -> bool:
+    return (raw_output_path or "").lower().endswith(_TEXT_PREVIEW_EXTS)
+
+
+def _is_image_preview_path(raw_output_path: str | None) -> bool:
+    return (raw_output_path or "").lower().endswith(_IMAGE_PREVIEW_EXTS)
+
+
+def _is_root_snapshot_output_path(raw_output_path: str | None) -> bool:
+    normalized = str(raw_output_path or "").strip().lower()
+    return normalized in ("", ".", "./", "/", "index.html", "index.json")
+
+
+def _static_snapshot_base_url(context, snapshot) -> str:
+    start_dir = Path(context["STATIC_EXPORT_DIR"])
+    relative_path = os.path.relpath(Path(snapshot.output_dir), start=start_dir).replace(os.sep, "/")
+    if relative_path == ".":
+        return "."
+    return f"./{quote(relative_path, safe=_STATIC_URL_SAFE)}"
+
+
+def _snapshot_base_url_for_context(context, snapshot) -> str:
+    if context.get("STATIC_EXPORT"):
+        return _static_snapshot_base_url(context, snapshot)
+    return get_snapshot_base_url(
+        str(_snapshot_id(snapshot)),
+        request=context.get("request"),
+        config=context.get("CONFIG"),
+    )
+
+
+def _snapshot_url_for_context(context, snapshot, path: str = "") -> str:
+    if not context.get("STATIC_EXPORT"):
+        path_part, separator, query = str(path or "").partition("?")
+        url = build_snapshot_url(
+            str(_snapshot_id(snapshot)),
+            path_part,
+            request=context.get("request"),
+            config=context.get("CONFIG"),
+        )
+        return f"{url}?{query}" if separator else url
+
+    base_url = _static_snapshot_base_url(context, snapshot)
+    raw_path = str(path or "")
+    if not raw_path:
+        return base_url
+    path_part, separator, query = raw_path.lstrip("/").partition("?")
+    quoted_path = quote(path_part, safe=_STATIC_URL_SAFE)
+    suffix = f"?{query}" if separator else ""
+    return f"{base_url.rstrip('/')}/{quoted_path}{suffix}"
+
+
+def _build_snapshot_preview_url(
+    snapshot_id: str,
+    path: str = "",
+    request=None,
+    config=None,
+    plugin: str = "",
+    base_url: str | None = None,
+) -> str:
+    if path == "about:blank":
+        return path
+    if _is_root_snapshot_output_path(path):
+        return (
+            f"{base_url.rstrip('/')}/index.jsonl"
+            if base_url
+            else build_snapshot_files_url(str(snapshot_id), request=request, config=config)
+        )
+    if base_url:
+        path_part, separator, query = str(path).lstrip("/").partition("?")
+        url = f"{base_url.rstrip('/')}/{quote(path_part, safe=_STATIC_URL_SAFE)}"
+        if separator:
+            url = f"{url}?{query}"
+    else:
+        path_part, separator, query = str(path).partition("?")
+        url = build_snapshot_url(str(snapshot_id), path_part, request=request, config=config)
+        if separator:
+            url = f"{url}?{query}"
+    path_parts = Path(path).parts
+    plugin = get_plugin_name(plugin) if plugin else (path_parts[0] if len(path_parts) > 1 else "")
+    has_plugin_preview = bool(plugin and get_plugin_template(plugin, "full", fallback=False))
+    if not (_is_text_preview_path(path) or _is_image_preview_path(path) or has_plugin_preview):
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}preview=1"
+
+
+def _render_text_preview(plugin: str, icon_html: str, snippet: str) -> str:
+    plugin_attr = escape(plugin or "")
+    plugin_label = escape(plugin or "")
+    escaped = escape(snippet)
+    return (
+        f'<div class="thumbnail-text" data-plugin="{plugin_attr}">'
+        f'<div class="thumbnail-text-header">'
+        f'<span class="thumbnail-compact-icon">{icon_html}</span>'
+        f'<span class="thumbnail-text-title">{plugin_label}</span>'
+        f"</div>"
+        f'<pre class="thumbnail-text-pre">{escaped}</pre>'
+        f"</div>"
+    )
+
+
+def _render_fallback_card(plugin: str, icon_html: str, fallback_label: str) -> str:
+    plugin_attr = escape(plugin or "")
+    plugin_label = escape(plugin or "")
+    fallback_attr = escape(fallback_label)
+    return (
+        f'<div class="thumbnail-compact" data-plugin="{plugin_attr}">'
+        f'<span class="thumbnail-compact-icon">{icon_html}</span>'
+        f'<span class="thumbnail-compact-label">{plugin_label}</span>'
+        f'<span class="thumbnail-compact-meta">{fallback_attr}</span>'
+        f"</div>"
+    )
+
+
+def _render_text_file_preview(snapshot_dir: str | Path | None, raw_output_path: str | None, plugin: str, icon_html: str) -> str | None:
+    output_file = _resolve_snapshot_output_file(snapshot_dir, raw_output_path)
+    if not output_file:
+        return None
+
+    try:
+        with output_file.open("rb") as f:
+            raw = f.read(4096)
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None
+        lines = text.splitlines()[:6]
+        snippet = "\n".join(lines)
+        return _render_text_preview(plugin, icon_html, snippet)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+@register.filter(name="split")
+def split(value, separator: str = ","):
+    return (value or "").split(separator)
+
+
+@register.filter(name="index")
+def index(value, position):
+    try:
+        return value[int(position)]
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+@register.filter
+def file_size(num_bytes: float, decimal_places: int = 1) -> str:
+    return printable_filesize(num_bytes, decimal_places)
+
+
+@register.filter
+def grid_file_size(num_bytes: float | None) -> str:
+    if not num_bytes or num_bytes <= 0:
+        return ""
+    return printable_filesize(num_bytes)
+
+
+@register.filter
+def intcomma(value: int | str | None) -> str:
+    try:
+        return f"{int(value or 0):,}"
+    except (TypeError, ValueError):
+        return str(value or "")
+
+
+@register.inclusion_tag("admin/snapshots_grid.html", takes_context=True, name="snapshots_grid")
+def result_list(context, cl):
+    """
+    Monkey patched result
+    """
+    num_sorted_fields = 0
+    request = context.get("request")
+    config = request.__dict__.get("archivebox_config") if request is not None else context.get("CONFIG")
+    results = cl.result_list
+    if config is not None:
+        for obj in results:
+            obj._runtime_config = config
+    # Cards of running snapshots hide their icons, so draw the shared icon
+    # sprite once above all cards rather than inside the first card's icons.
+    icon_sprite = ""
+    if request is not None and not request.__dict__.get("_archivebox_icon_sprite_sent"):
+        request._archivebox_icon_sprite_sent = True
+        icon_sprite = get_plugin_icon_sprite()
+    return {
+        "cl": cl,
+        "num_sorted_fields": num_sorted_fields,
+        "results": [(obj, cl.model_admin.files(obj)) for obj in results],
+        "icon_sprite": icon_sprite,
+        "request": request,
+        "CONFIG": config,
+    }
+
+
+_LOW_DISK_THRESHOLD_GB = 1.0
+_HIGH_MEMORY_THRESHOLD_PCT = 95.0
+_HIGH_LOAD_MULTIPLE = 3  # 15-min loadavg > 3 * cpu_count
+_HEALTH_CHECK_INTERVAL_SECONDS = 30
+_health_cache: dict = {"checked_at": 0.0, "stats": {}}
+
+
+def _machine_health_stats() -> dict:
+    """Cached wrapper around the Machine-admin stats util.
+
+    The Machine list/change pages already render disk / mem / load via
+    ``archivebox.machine.detect.get_host_stats()`` — we reuse the same call so
+    the banner thresholds line up 1:1 with what's shown on /admin/machine/.
+    Cached for 30s because the inclusion tag fires on every page render and
+    ``get_host_stats`` shells into several psutil probes.
+    """
+    import time
+
+    now = time.monotonic()
+    if _health_cache["stats"] and (now - _health_cache["checked_at"]) < _HEALTH_CHECK_INTERVAL_SECONDS:
+        return _health_cache["stats"]
+
+    try:
+        from archivebox.machine.detect import get_host_stats
+
+        stats = get_host_stats() or {}
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        stats = {}
+
+    _health_cache["checked_at"] = now
+    _health_cache["stats"] = stats
+    return stats
+
+
+@register.inclusion_tag("system_warnings_banner.html", takes_context=True)
+def system_warnings_banner(context):
+    """Render the top-of-page warning banner for one of the conditions below,
+    in priority order (highest first):
+
+    1. ``mode="unconfigured"``— ``BASE_URL`` is empty and the operator has
+       not selected safe single-domain routing. That mode intentionally uses
+       each device's connection address, including LAN and Tailscale IPs.
+    2. ``mode="base_url_mismatch"`` — the browser reached ArchiveBox through
+       an origin that differs from the configured canonical ``BASE_URL``.
+    3. ``mode="unsafe"``      — ``SERVER_SECURITY_MODE`` explicitly enables
+       a lower-security replay mode.
+    4. ``mode="low_disk"``    — ``DATA_DIR`` has <1 GiB free; new archive
+       jobs will start failing on ENOSPC.
+    5. ``mode="high_memory"`` — virtual memory utilization at/above 95%; the
+       host is one OOM-kill from a crash.
+    6. ``mode="high_load"``   — 15-minute load average exceeds 3 × CPU count
+       (the kernel's own sustained-load EMA, so no rolling buffer of ours is
+       needed).
+
+    Config/security warnings come first because they affect correctness +
+    security and need explicit operator action; host-health warnings come
+    after and reuse ``machine.detect.get_host_stats`` (the same function that
+    populates the Machine admin page), cached for 30s.
+    """
+    if context.get("first_admin_setup"):
+        return {"mode": ""}
+
+    config = context.get("CONFIG")
+    if config is None:
+        from archivebox.config.common import get_config
+
+        config = get_config(resolve_plugins=False)
+
+    if not config.BASE_URL and config.SERVER_SECURITY_MODE != "safe-onedomain-nojsreplay":
+        return get_setup_wizard_context(context.get("request"), config)
+    mismatch = get_base_url_mismatch_context(context.get("request"), config)
+    if mismatch and not _is_web_subdomain_alias(mismatch["browser_url"], mismatch["configured_base_url"]):
+        return mismatch
+    if config.IS_LOWER_SECURITY_MODE:
+        return {"mode": "unsafe"}
+
+    stats = _machine_health_stats()
+    free_gb = stats.get("disk_data_free_gb")
+    if isinstance(free_gb, (int, float)) and free_gb < _LOW_DISK_THRESHOLD_GB:
+        return {"mode": "low_disk", "free_gb": f"{free_gb:.2f}"}
+
+    mem_pct = stats.get("mem_virt_used_pct")
+    if isinstance(mem_pct, (int, float)) and mem_pct >= _HIGH_MEMORY_THRESHOLD_PCT:
+        return {"mode": "high_memory", "mem_pct": f"{mem_pct:.1f}"}
+
+    cpu_load = stats.get("cpu_load") or ()
+    cpu_count = stats.get("cpu_count") or 1
+    # ``cpu_load`` is the (1min, 5min, 15min) tuple from psutil.getloadavg();
+    # we take the 15-min figure because the operator's threshold was
+    # "sustained for 15min" and the kernel already maintains that EMA.
+    load_15 = cpu_load[2] if isinstance(cpu_load, (list, tuple)) and len(cpu_load) >= 3 else None
+    if isinstance(load_15, (int, float)) and load_15 > _HIGH_LOAD_MULTIPLE * cpu_count:
+        if os.environ.get("UI_SCREENSHOT_HIDE_HIGH_LOAD_WARNING") == "1":
+            return {"mode": ""}
+        return {
+            "mode": "high_load",
+            "load_15": f"{load_15:.2f}",
+            "cpu_count": cpu_count,
+            "load_threshold": _HIGH_LOAD_MULTIPLE * cpu_count,
+        }
+
+    return {"mode": ""}
+
+
+@register.simple_tag(takes_context=True)
+def url_replace(context, **kwargs):
+    dict_ = context["request"].GET.copy()
+    for key, value in kwargs.items():
+        dict_[key] = value
+    return dict_.urlencode()
+
+
+@register.simple_tag(takes_context=True)
+def admin_base_url(context) -> str:
+    return get_admin_base_url(request=context.get("request"), config=context.get("CONFIG"))
+
+
+@register.simple_tag(takes_context=True)
+def web_base_url(context) -> str:
+    return get_web_base_url(request=context.get("request"), config=context.get("CONFIG"))
+
+
+@register.simple_tag(takes_context=True)
+def static_export_root_url(context) -> str:
+    if not context.get("STATIC_EXPORT"):
+        return ""
+    relative_path = os.path.relpath(CONSTANTS.DATA_DIR, start=Path(context["STATIC_EXPORT_DIR"]))
+    relative_path = relative_path.replace(os.sep, "/")
+    return "./" if relative_path == "." else f"{quote(relative_path, safe=_STATIC_URL_SAFE)}/"
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_base_url(context, snapshot) -> str:
+    return _snapshot_base_url_for_context(context, snapshot)
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_detail_url(context, snapshot) -> str:
+    """Keep the trusted snapshot detail page on web.*, not the replay host."""
+    if context.get("STATIC_EXPORT"):
+        return _snapshot_url_for_context(context, snapshot, "index.html")
+    return build_snapshot_detail_url(
+        snapshot.archive_path_from_db,
+        request=context.get("request"),
+        config=context.get("CONFIG"),
+    )
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_url(context, snapshot, path: str = "") -> str:
+    return _snapshot_url_for_context(context, snapshot, path)
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_files_url(context, snapshot, path: str = "") -> str:
+    if context.get("STATIC_EXPORT"):
+        return _snapshot_url_for_context(context, snapshot, "index.jsonl")
+    return build_snapshot_files_url(
+        str(_snapshot_id(snapshot)),
+        path,
+        request=context.get("request"),
+        config=context.get("CONFIG"),
+    )
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_zip_url(context, snapshot, path: str = "") -> str:
+    if context.get("STATIC_EXPORT"):
+        return ""
+    return build_snapshot_zip_url(
+        str(_snapshot_id(snapshot)),
+        path,
+        request=context.get("request"),
+        config=context.get("CONFIG"),
+    )
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_role_output_url(context, snapshot, role: str, fallback_to_default: bool = False) -> str:
+    url_cache = snapshot.__dict__.setdefault("_snapshot_role_output_url_cache", {})
+    cache_key = (
+        role,
+        bool(context.get("STATIC_EXPORT")),
+        str(context.get("STATIC_EXPORT_DIR") or ""),
+        fallback_to_default,
+    )
+    if cache_key in url_cache:
+        return url_cache[cache_key]
+
+    from archivebox.plugins.discovery import get_snapshot_role_names
+
+    if context.get("STATIC_EXPORT"):
+        output_path = None
+        for plugin in get_snapshot_role_names(role):
+            output_path = snapshot.plugin_output_path(plugin)
+            if output_path:
+                break
+        url_cache[cache_key] = _snapshot_url_for_context(context, snapshot, output_path) if output_path else ""
+    else:
+        url_cache[cache_key] = build_snapshot_role_output_url(
+            snapshot,
+            role,
+            request=context.get("request"),
+            config=context.get("CONFIG"),
+            fallback_to_default=fallback_to_default,
+        )
+    return url_cache[cache_key]
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_result_file_url(context, snapshot, result, path: str) -> str:
+    """Build a saved-file URL from one ArchiveResult declaration."""
+    try:
+        output_path = result.output_file_path(path)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return ""
+    if not output_path:
+        return ""
+    return _snapshot_url_for_context(context, snapshot, output_path)
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_thumbnail(context, snapshot, admin=False, width="100px", height="100px"):
+    from django.template.loader import render_to_string
+
+    from archivebox.plugins.output_groups import snapshot_thumbnail_result
+
+    # List pages pick the card with their batch of results (list_results_util).
+    precomputed = "_snapshot_thumbnail_result" in snapshot.__dict__
+    results = () if precomputed else snapshot.__dict__.get("_snapshot_card_results")
+    if results is None:
+        results = snapshot.__dict__.get("_admin_output_results")
+    if results is None:
+        results = snapshot.__dict__.get("_admin_archiveresults")
+    if results is None:
+        results = snapshot.__dict__.get("_prefetched_objects_cache", {}).get("archiveresult_set")
+    if results is None:
+        results = snapshot.archiveresult_set.exclude(plugin="").only(
+            "id",
+            "snapshot_id",
+            "plugin",
+            "status",
+            "output_str",
+            "output_files",
+            "output_size",
+        )
+
+    try:
+        host = urlparse(snapshot.url).hostname or "Archive"
+    except ValueError:
+        host = "Archive"
+    host = host.removeprefix("www.")
+    hue = int(hashlib.sha256(host.encode()).hexdigest()[:6], 16) % 360
+    return mark_safe(
+        render_to_string(
+            "core/snapshot_thumbnail.html",
+            {
+                **context.flatten(),
+                "card_result": snapshot.__dict__["_snapshot_thumbnail_result"] if precomputed else snapshot_thumbnail_result(results),
+                "card_modified_at": snapshot.modified_at,
+                "host": host,
+                "initial": host[:1].upper(),
+                "hue": hue,
+                "width": width,
+                "height": height,
+            },
+        ),
+    )
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_index_row(context, link) -> str:
+    detail_url = snapshot_detail_url(context, link)
+
+    status = getattr(link, "status", None) or "unknown"
+    bookmarked_at = getattr(link, "bookmarked_at", None)
+    timestamp = getattr(link, "timestamp", "")
+    if bookmarked_at:
+        bookmarked_at = timezone.localtime(bookmarked_at)
+        date_text = bookmarked_at.strftime("%Y-%m-%d")
+        time_text = bookmarked_at.strftime("%H:%M")
+        sort_value = str(bookmarked_at.timestamp())
+        title_time = f"Bookmarked: {bookmarked_at} ({timestamp})"
+    else:
+        date_text = ""
+        time_text = ""
+        sort_value = ""
+        title_time = f"Bookmarked: ({timestamp})"
+
+    url = getattr(link, "url", "") or ""
+    title = unescape(getattr(link, "title", "") or "")
+    title_text = title or url
+    tags_str = link.tags_str() if callable(getattr(link, "tags_str", None)) else getattr(link, "tags_str", "")
+    tag_html = "".join(
+        f'<span class="snapshot-tag" title="{escape(tag)}">{escape(tag)}</span>' for tag in (tags_str or "").split(",") if tag
+    )
+    if tag_html:
+        tag_cell = f'<span class="snapshot-tags">{tag_html}</span>'
+    else:
+        tag_cell = '<span class="empty-value">...</span>'
+
+    num_outputs = int(getattr(link, "num_outputs", 0) or 0)
+    if context.get("STATIC_EXPORT") and callable(getattr(link, "icons", None)):
+        icons = link.icons(path=quote(link.static_archive_path, safe=_STATIC_URL_SAFE), prefix="./", quote_paths=True)
+    else:
+        icons = link.icons() if callable(getattr(link, "icons", None)) else getattr(link, "icons", "")
+    icons_cell = str(icons) if icons else '<span class="empty-value">...</span>'
+    archive_size = int(getattr(link, "archive_size", 0) or 0)
+    size_cell = file_size(archive_size) if archive_size else '<span class="empty-value">...</span>'
+    output_plural = "" if num_outputs == 1 else "s"
+    files_url = snapshot_files_url(context, link)
+
+    preview_html = snapshot_thumbnail(context, link)
+
+    if "_public_list_icon_paths" in link.__dict__:
+        list_icon_paths = list(getattr(link, "_public_list_icon_paths", []) or [])
+        if list_icon_paths:
+            favicon_urls = [_snapshot_url_for_context(context, link, path) for path in list_icon_paths]
+            favicon_html = (
+                f'<img src="{escape(favicon_urls[0])}" '
+                f'data-fallbacks="{escape(",".join(favicon_urls[1:]))}" '
+                'onerror="nextPublicSnapshotPreview(this)" '
+                'class="link-favicon" alt="" decoding="async" loading="lazy">'
+            )
+        else:
+            favicon_html = '<span class="link-favicon link-favicon-empty" aria-hidden="true"></span>'
+    else:
+        favicon_url = snapshot_role_output_url(context, link, "list_icon")
+        favicon_html = (
+            (
+                f'<img src="{escape(favicon_url)}" '
+                'data-fallbacks="" '
+                'onerror="nextPublicSnapshotPreview(this)" '
+                'class="link-favicon" alt="" decoding="async" loading="lazy">'
+            )
+            if favicon_url
+            else '<span class="link-favicon link-favicon-empty" aria-hidden="true"></span>'
+        )
+
+    html = f"""
+<tr class="snapshot-row status-{escape(status)}">
+    <td class="snapshot-time" title="{escape(title_time)}" data-sort="{escape(sort_value)}">
+        <a href="{escape(detail_url)}">
+            <span>{escape(date_text)}</span>
+            <small>{escape(time_text)}</small>
+        </a>
+    </td>
+    <td class="snapshot-preview-cell">
+        <a href="{escape(detail_url)}" title="Open archived snapshot">
+            {preview_html}
+        </a>
+    </td>
+    <td class="snapshot-title-cell" title="{escape(title or url)}">
+        <div class="snapshot-title-line">
+            <a href="{escape(detail_url)}" class="snapshot-title">
+                {escape(Truncator(title_text).chars(110) if title_text != url else url)}
+            </a>
+        </div>
+        <a href="{escape(url)}" class="snapshot-url" title="{escape(url)}" target="_blank" rel="noopener noreferrer">
+            {favicon_html}<span class="snapshot-url-text">{snapshot_url_text(url)}</span>
+        </a>
+        <span class="snapshot-mobile-saved">Saved {escape(date_text)} at {escape(time_text)}</span>
+    </td>
+    <td class="snapshot-tags-cell">
+        {tag_cell}
+    </td>
+    <td class="snapshot-status-cell">
+        <span class="snapshot-status">{escape(status)}</span>
+    </td>
+    <td class="snapshot-files-cell">
+        <span data-number-for="{escape(url)}" title="{num_outputs} successful outputs">
+            {icons_cell}
+        </span>
+    </td>
+    <td class="snapshot-size-cell">
+        <a href="{escape(files_url)}" title="View archived file manifest">
+            {size_cell}
+        </a>
+        <small>{num_outputs} output{output_plural}</small>
+    </td>
+</tr>
+"""
+    return mark_safe(html)
+
+
+@register.simple_tag(takes_context=True)
+def snapshot_preview_url(context, snapshot, path: str = "", result=None) -> str:
+    snapshot_id = _snapshot_id(snapshot)
+    plugin = getattr(result, "plugin", "") if result else ""
+    return _build_snapshot_preview_url(
+        str(snapshot_id),
+        path,
+        request=context.get("request"),
+        config=context.get("CONFIG"),
+        plugin=plugin,
+        base_url=_snapshot_base_url_for_context(context, snapshot) if context.get("STATIC_EXPORT") else None,
+    )
+
+
+@register.simple_tag
+def plugin_icon_sprite() -> str:
+    """Every list-row plugin icon's SVG, drawn once per page (see get_plugin_list_icon)."""
+    return get_plugin_icon_sprite()
+
+
+@register.simple_tag
+def plugin_icon(plugin: str) -> str:
+    """
+    Render the icon for a plugin.
+
+    Usage: {% plugin_icon "screenshot" %}
+    """
+    icon_html = get_plugin_icon(plugin)
+    return mark_safe(
+        f'<span class="abx-plugin-icon" style="display:inline-flex; width:20px; height:20px; align-items:center; justify-content:center;">{icon_html}</span>',
+    )
+
+
+def _version_card_url(context, result, url: str) -> str:
+    """Keep warm cards reusable, but invalidate their assets after a recapture."""
+    if context.get("STATIC_EXPORT"):
+        return url
+    modified = context.get("card_modified_at") or result.modified_at
+    revision = f"{int(modified.timestamp())}.{modified.microsecond:06d}"
+    parts = urlsplit(url)
+    query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "_abx_rev"]
+    return urlunsplit(parts._replace(query=urlencode([*query, ("_abx_rev", revision)])))
+
+
+@register.simple_tag(takes_context=True)
+def plugin_card(context, result) -> str:
+    """
+    Render the card template for an archive result.
+
+    Usage: {% plugin_card result %}
+
+    Context variables passed to template:
+        - result: ArchiveResult object
+        - snapshot: Parent Snapshot object
+        - output_path: Path to output relative to snapshot dir (from embed_path())
+        - plugin: Plugin base name
+    """
+    from archivebox.core.models import ArchiveResult
+
+    if result is None or not isinstance(result, ArchiveResult):
+        return ""
+
+    plugin = get_plugin_name(result.plugin)
+    if not context.get("STATIC_EXPORT"):
+        # The cover and expanded stack both embed this one card document. Run
+        # plugin code on the snapshot origin so it can read saved files without
+        # exposing raw archives or the admin session to the collection page.
+        # snapshot_id is on the row already; result.snapshot would load the
+        # whole parent Snapshot once per list row just to read its id.
+        card_url = build_snapshot_url(
+            str(result.snapshot_id),
+            f"_card/{result.id}",
+            request=context.get("request"),
+            config=context.get("CONFIG"),
+        )
+        return mark_safe(
+            f'<iframe src="{escape(_version_card_url(context, result, card_url))}" title="{escape(plugin)} card" '
+            'loading="lazy" fetchpriority="low" sandbox="allow-scripts allow-same-origin" '
+            'style="width:100% !important;height:100% !important;transform:none !important;border:0"></iframe>',
+        )
+    return render_plugin_card_document(context, result)
+
+
+@register.simple_tag
+def snapshot_results(snapshot, plugins: str):
+    """Load the named plugins' manifests once for reuse across template loops."""
+    names = {name.strip() for name in plugins.split(",") if name.strip()}
+    prefetched = snapshot.__dict__.get("_prefetched_objects_cache", {}).get("archiveresult_set")
+    if prefetched is not None:
+        return [result for result in prefetched if result.plugin in names]
+    # The reverse manager needs snapshot_id to attach its known parent without
+    # fetching that deferred field separately for every result.
+    return snapshot.archiveresult_set.filter(plugin__in=names).only("snapshot_id", "plugin", "output_files")
+
+
+@register.simple_tag
+def manifest_file_count(captures, plugin: str, exclude_parts: str = "", exclude_prefixes: str = "", exclude_names: str = "") -> int:
+    """Count distinct valid plugin-relative paths from already-loaded manifests."""
+    excluded_parts = set(filter(None, exclude_parts.split(",")))
+    excluded_prefixes = tuple(filter(None, exclude_prefixes.split(",")))
+    excluded_names = set(filter(None, exclude_names.split(",")))
+    paths = set()
+    for capture in captures:
+        if capture.plugin != plugin or not isinstance(capture.output_files, dict):
+            continue
+        for path, info in capture.output_files.items():
+            # Preserve literal manifest path semantics, including root-relative
+            # references. Filesystem normalization would hide invalid ./ or //
+            # components; rebuilding OutputManifest would copy/sort every row.
+            relative = path if isinstance(info, dict) and info.get("root_relative") else f"{plugin}/{path}"
+            relative = relative.removeprefix(f"{plugin}/")
+            parts = relative.split("/")
+            if any(part in {"", ".", ".."} for part in parts):
+                continue
+            if excluded_parts.intersection(parts) or relative.startswith(excluded_prefixes) or relative in excluded_names:
+                continue
+            paths.add(relative)
+    # Cards need this scalar, not thousands of serialized paths. Exclusions
+    # belong to the calling plugin; the full file-browser manifest is untouched.
+    return len(paths)
+
+
+class PassiveCardFrames(HTMLParser):
+    """Select the thumbnail representation only for already scriptless frames."""
+
+    def __init__(self, document: str, output_url: str):
+        super().__init__()
+        self.output_url = output_url
+        self.offsets = [0, *(match.end() for match in re.finditer("\n", document))]
+        self.edits = []
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if (
+            tag != "iframe"
+            or values.get("src") != self.output_url
+            or "sandbox" not in values
+            or "allow-scripts" in (values["sandbox"] or "").lower().split()
+        ):
+            return
+        url = urlsplit(self.output_url)
+        query = [item for item in parse_qsl(url.query, keep_blank_values=True) if item[0] != "preview"]
+        thumbnail_url = urlunsplit(url._replace(query=urlencode([*query, ("preview", "thumbnail")])))
+        attributes = "".join(
+            f' {name}="{escape(thumbnail_url if name == "src" else value)}"' if value is not None else f" {name}" for name, value in attrs
+        )
+        line, column = self.getpos()
+        start = self.offsets[line - 1] + column
+        self.edits.append((start, start + len(self.get_starttag_text()), f"<iframe{attributes}>"))
+
+
+def render_plugin_card_document(context, result) -> str:
+    """Render one plugin card template for the trusted snapshot-origin frame."""
+    plugin = get_plugin_name(result.plugin)
+    has_card_template = bool(get_plugin_template(plugin, "card", fallback=False))
+    template_str = get_plugin_template(plugin, "card")
+
+    # Use embed_path() for the display path
+    raw_output_path = result.embed_path() or ""
+    output_url = _version_card_url(context, result, _snapshot_url_for_context(context, result.snapshot, raw_output_path or ""))
+
+    icon_html = get_plugin_icon(plugin)
+    media_files = _list_media_files(result, include_filesystem_fallback=bool(context.get("STATIC_EXPORT")))
+    media_file_count = len(media_files)
+    if context.get("STATIC_EXPORT") and media_files:
+        media_files = [
+            item
+            for item in media_files
+            if (media_path := Path(str(item.get("path") or "")))
+            and not media_path.is_absolute()
+            and ".." not in media_path.parts
+            and (Path(result.snapshot_dir) / media_path).is_file()
+        ]
+        media_file_count = len(media_files)
+    if media_files:
+        for item in media_files:
+            path = item.get("path") or ""
+            item["url"] = _version_card_url(context, result, _snapshot_url_for_context(context, result.snapshot, path)) if path else ""
+
+    output_lower = (raw_output_path or "").lower()
+    force_text_preview = output_lower.endswith(_TEXT_PREVIEW_EXTS)
+
+    # Static exports cannot execute live preview routes; keep their text snippets.
+    if context.get("STATIC_EXPORT") and force_text_preview:
+        template_str = None
+
+    # Create a mini template and render it with context
+    try:
+        if (
+            template_str
+            and raw_output_path
+            and str(raw_output_path).strip() not in (".", "/", "./")
+            and (has_card_template or not force_text_preview)
+        ):
+            tpl = template.Template(template_str)
+            ctx = template.Context(
+                {
+                    **context.flatten(),
+                    "result": result,
+                    "snapshot": result.snapshot,
+                    "output_path": output_url,
+                    "output_path_raw": raw_output_path,
+                    "plugin": plugin,
+                    "plugin_icon": icon_html,
+                    "media_file_count": media_file_count,
+                    "media_files": media_files,
+                },
+            )
+            rendered = tpl.render(ctx)
+            if not context.get("STATIC_EXPORT") and output_lower.endswith((".html", ".htm")):
+                # A sandbox stops execution, but Chrome's preload scanner can
+                # still fetch script tags. Full replay keeps its original URL.
+                frames = PassiveCardFrames(rendered, output_url)
+                frames.feed(rendered)
+                for start, end, replacement in reversed(frames.edits):
+                    rendered = rendered[:start] + replacement + rendered[end:]
+            # Only return non-empty content (strip whitespace to check)
+            if rendered.strip():
+                if rendered.lstrip().lower().startswith("<!doctype html"):
+                    rendered = rendered.replace("</head>", CARD_OVERFLOW_STYLE + "</head>", 1)
+                if context.get("STATIC_EXPORT") and rendered.lstrip().lower().startswith("<!doctype html"):
+                    # Static exports have no _card route. Keep the same card
+                    # document in both stack positions, with relative saved-file
+                    # URLs resolved against the exported index page.
+                    return mark_safe(
+                        f'<iframe srcdoc="{escape(rendered)}" title="{escape(plugin)} card" '
+                        'loading="lazy" sandbox="allow-scripts allow-same-origin" '
+                        'style="width:100% !important;height:100% !important;max-width:100% !important;'
+                        'transform:none !important;border:0"></iframe>',
+                    )
+                return mark_safe(rendered)
+    except (template.TemplateSyntaxError, AttributeError, TypeError, ValueError):
+        rendered = ""
+
+    if force_text_preview and not context.get("STATIC_EXPORT"):
+        # Read archived text only when the browser requests its preview, never
+        # while rendering the outer snapshot HTML (payloads may live on B2).
+        preview_url = _build_snapshot_preview_url(
+            str(_snapshot_id(result.snapshot)),
+            raw_output_path,
+            request=context.get("request"),
+            config=context.get("CONFIG"),
+            plugin=plugin,
+        )
+        return mark_safe(
+            f'<iframe src="{escape(_version_card_url(context, result, preview_url))}" title="{escape(plugin)} preview" '
+            'loading="lazy" fetchpriority="low" sandbox="allow-scripts allow-same-origin" '
+            'style="border:0;pointer-events:none"></iframe>',
+        )
+
+    if force_text_preview and context.get("STATIC_EXPORT"):
+        preview = _render_text_file_preview(result.snapshot_dir, raw_output_path, plugin, icon_html)
+        if preview:
+            return mark_safe(preview)
+
+    if output_lower.endswith(_TEXT_PREVIEW_EXTS):
+        fallback_label = "text"
+    else:
+        fallback_label = "output"
+
+    return mark_safe(_render_fallback_card(plugin, icon_html, fallback_label))
+
+
+@register.simple_tag
+def output_card(snapshot, output_path: str, plugin: str) -> str:
+    plugin_name = get_plugin_name(plugin)
+    icon_html = get_plugin_icon(plugin_name)
+    preview = _render_text_file_preview(snapshot.output_dir, output_path, plugin_name, icon_html)
+    if preview:
+        return mark_safe(preview)
+
+    output_lower = (output_path or "").lower()
+    fallback_label = "text" if output_lower.endswith(_TEXT_PREVIEW_EXTS) else "output"
+    return mark_safe(_render_fallback_card(plugin_name, icon_html, fallback_label))
+
+
+@register.simple_tag(takes_context=True)
+def plugin_full(context, result) -> str:
+    """
+    Render the full template for an archive result.
+
+    Usage: {% plugin_full result %}
+    """
+    from archivebox.core.models import ArchiveResult
+
+    if result is None or not isinstance(result, ArchiveResult):
+        return ""
+
+    plugin = get_plugin_name(result.plugin)
+    template_str = get_plugin_template(plugin, "full")
+
+    if not template_str:
+        return ""
+
+    raw_output_path = ""
+    raw_output_path = result.embed_path_db() or ""
+    if not raw_output_path:
+        raw_output_path = result.embed_path() or ""
+    if _is_root_snapshot_output_path(raw_output_path):
+        return ""
+    output_url = _snapshot_url_for_context(context, result.snapshot, raw_output_path)
+
+    try:
+        catalog = get_plugin_catalog()
+        tpl = template.Engine(
+            dirs=[catalog[plugin].path] if plugin in catalog else [],
+            libraries=template.Engine.get_default().libraries,
+        ).from_string(template_str)
+        ctx = template.Context(
+            {
+                "result": result,
+                "snapshot": result.snapshot,
+                "output_path": output_url,
+                "output_path_raw": raw_output_path,
+                "plugin": plugin,
+                "plugin_icon": get_plugin_icon(plugin),
+            },
+        )
+        rendered = tpl.render(ctx)
+        # Only return non-empty content (strip whitespace to check)
+        if rendered.strip():
+            return mark_safe(rendered)
+        return ""
+    except (template.TemplateSyntaxError, AttributeError, TypeError, ValueError):
+        return ""
+
+
+@register.filter
+def plugin_name(value: str) -> str:
+    """
+    Get the base name of a plugin (strips numeric prefix).
+
+    Usage: {{ result.plugin|plugin_name }}
+    """
+    return get_plugin_name(value)
+
+
+@register.simple_tag(takes_context=True)
+def api_token(context) -> str:
+    """
+    Return an API token string for the logged-in user, creating one if needed.
+    """
+    from archivebox.api.auth import get_or_create_api_token
+
+    request = context.get("request")
+    user = request.user
+    if not user or not user.is_authenticated:
+        return ""
+
+    token = get_or_create_api_token(user)
+    return token.token if token else ""

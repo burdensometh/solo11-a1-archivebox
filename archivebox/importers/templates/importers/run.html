@@ -1,0 +1,6 @@
+{% extends "importers/base.html" %}
+{% block importer_content %}
+<div class="toolbar"><div><p class="eyebrow"><a href="{{ run.source.get_absolute_url }}">{{ run.source.name }}</a></p><h1>{{ run.get_action_display }}</h1><p><strong>Persona:</strong> {% if run.source.persona_id %}<a href="{% url 'admin:personas_persona_change' run.source.persona_id %}">{{ run.source.persona.name }} ↗</a>{% else %}Server defaults{% endif %}</p><p>{{ run.created_at }}</p></div><a class="button" href="{% url 'importers:run-json' run.pk %}">Download items JSON</a></div>
+<section data-activity-url="{% url 'importers:run-activity' run.pk %}">{% include "importers/run_body.html" %}</section>
+{% include "importers/updates.html" %}
+{% endblock %}

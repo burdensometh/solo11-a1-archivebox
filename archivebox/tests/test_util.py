@@ -1,0 +1,257 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+import json
+
+import pytest
+
+from archivebox.misc.util import download_url, find_all_urls, fix_url_from_markdown, parse_date, sanitize_extracted_url
+from archivebox.tests.conftest import get_free_port, run_python_cwd
+
+
+def test_port_allocations_do_not_repeat_across_processes(tmp_path):
+    script = """
+import json
+from archivebox.tests.conftest import get_free_port
+print(json.dumps([get_free_port() for _ in range(256)]))
+"""
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: run_python_cwd(script, tmp_path), range(4)))
+    ports = [get_free_port() for _ in range(256)]
+    for stdout, stderr, returncode in results:
+        assert returncode == 0, stderr
+        ports.extend(json.loads(stdout))
+    assert len(ports) == 1280
+    assert len(set(ports)) == len(ports), "Parallel services must not receive the same port"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2025-07-30T08:00:00-04:00", "2025-07-30T17:30:00+05:30", "2025-07-30T12:00:00+00:00", "2025-07-30T12:00:00"],
+)
+def test_parse_date_normalizes_datetime_and_string_identically(value):
+    expected = datetime(2025, 7, 30, 12, tzinfo=timezone.utc)
+    for source in (value, datetime.fromisoformat(value)):
+        parsed = parse_date(source)
+        assert parsed == expected
+        assert parsed.tzinfo is timezone.utc
+
+
+class _ExampleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"<html><body><h1>Example Domain</h1></body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
+def test_download_url_downloads_content():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ExampleHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        text = download_url(f"http://127.0.0.1:{server.server_address[1]}/")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert "Example Domain" in text
+
+
+# URL parsing regression tests — last-line-of-defense to make sure URL_REGEX
+# and fix_url_from_markdown don't regress due to regex engine / cpython / locale
+# differences. Bad URL parsing leads to many incorrectly archived links, so
+# these checks are worth running.
+
+
+@pytest.mark.parametrize(
+    "input_url,expected",
+    [
+        (
+            "http://example.com/a(b)c).x(y)z",
+            "http://example.com/a(b)c",
+        ),
+        (
+            "https://wikipedia.org/en/some_article_(Disambiguation).html?abc=def).link(with)_trailingtext",
+            "https://wikipedia.org/en/some_article_(Disambiguation).html?abc=def",
+        ),
+    ],
+)
+def test_fix_url_from_markdown_trims_trailing_junk(input_url, expected):
+    assert fix_url_from_markdown(input_url) == expected
+
+
+URL_REGEX_CASES = [
+    ("https://example.com", ["https://example.com"]),
+    ("https://sweeting.me,https://google.com", ["https://sweeting.me", "https://google.com"]),
+    (
+        "http://abc-file234example.com/abc?def=abc&23423=sdfsdf#abc=234&234=a234",
+        ["http://abc-file234example.com/abc?def=abc&23423=sdfsdf#abc=234&234=a234"],
+    ),
+    (
+        "https://twitter.com/share?url=https://akaao.success-corp.co.jp&text=ア@サ!ト&hashtags=ア%オ,元+ア.ア-オ_イ*シ$ロ abc",
+        [
+            "https://twitter.com/share?url=https://akaao.success-corp.co.jp&text=ア@サ!ト&hashtags=ア%オ,元+ア.ア-オ_イ*シ$ロ",
+            "https://akaao.success-corp.co.jp&text=ア@サ!ト&hashtags=ア%オ,元+ア.ア-オ_イ*シ$ロ",
+        ],
+    ),
+    (
+        '<a href="https://twitter.com/share#url=https://akaao.success-corp.co.jp&text=ア@サ!ト?hashtags=ア%オ,元+ア&abc=.ア-オ_イ*シ$ロ"> abc',
+        [
+            "https://twitter.com/share#url=https://akaao.success-corp.co.jp&text=ア@サ!ト?hashtags=ア%オ,元+ア&abc=.ア-オ_イ*シ$ロ",
+            "https://akaao.success-corp.co.jp&text=ア@サ!ト?hashtags=ア%オ,元+ア&abc=.ア-オ_イ*シ$ロ",
+        ],
+    ),
+    ("///a", []),
+    ("http://", []),
+    ("http://../", ["http://../"]),
+    ("http://-error-.invalid/", ["http://-error-.invalid/"]),
+    ("https://a(b)c+1#2?3&4/", ["https://a(b)c+1#2?3&4/"]),
+    ("http://उदाहरण.परीक्षा", ["http://उदाहरण.परीक्षा"]),
+    ("http://例子.测试", ["http://例子.测试"]),
+    ("http://➡.ws/䨹 htps://abc.1243?234", ["http://➡.ws/䨹"]),
+    ('http://⌘.ws">https://exa+mple.com//:abc ', ["http://⌘.ws", "https://exa+mple.com//:abc"]),
+    ("http://مثال.إختبار/abc?def=ت&ب=abc#abc=234", ["http://مثال.إختبار/abc?def=ت&ب=abc#abc=234"]),
+    ("http://-.~_!$&()*+,;=:%40:80%2f::::::@example.c'om", ["http://-.~_!$&()*+,;=:%40:80%2f::::::@example.c"]),
+    (
+        "http://us:pa@ex.co:42/http://ex.co:19/a?_d=4#-a=2.3",
+        ["http://us:pa@ex.co:42/http://ex.co:19/a?_d=4#-a=2.3", "http://ex.co:19/a?_d=4#-a=2.3"],
+    ),
+    ("http://code.google.com/events/#&product=browser", ["http://code.google.com/events/#&product=browser"]),
+    ("http://foo.bar?q=Spaces should be encoded", ["http://foo.bar?q=Spaces"]),
+    ("http://foo.com/blah_(wikipedia)#c(i)t[e]-1", ["http://foo.com/blah_(wikipedia)#c(i)t"]),
+    ("http://foo.com/(something)?after=parens", ["http://foo.com/(something)?after=parens"]),
+    ("http://foo.com/unicode_(✪)_in_parens) abc", ["http://foo.com/unicode_(✪)_in_parens"]),
+    ("http://foo.bar/?q=Test%20URL-encoded%20stuff", ["http://foo.bar/?q=Test%20URL-encoded%20stuff"]),
+    ("[xyz](http://a.b/?q=(Test)%20U)RL-encoded%20stuff", ["http://a.b/?q=(Test)%20U"]),
+    ("[xyz](http://a.b/?q=(Test)%20U)-ab https://abc+123", ["http://a.b/?q=(Test)%20U", "https://abc+123"]),
+    ("[xyz](http://a.b/?q=(Test)%20U) https://a(b)c+12)3", ["http://a.b/?q=(Test)%20U", "https://a(b)c+12"]),
+    ("[xyz](http://a.b/?q=(Test)a\nabchttps://a(b)c+12)3", ["http://a.b/?q=(Test)a", "https://a(b)c+12"]),
+]
+
+
+@pytest.mark.parametrize("urls_str,expected_url_matches", URL_REGEX_CASES)
+def test_find_all_urls_matches_expected(urls_str, expected_url_matches):
+    assert list(find_all_urls(urls_str)) == expected_url_matches
+
+
+URL_REGEX_COUNT_CASES = {
+    "example.com": 0,
+    "/example.com": 0,
+    "//example.com": 0,
+    ":/example.com": 0,
+    "://example.com": 0,
+    "htt://example8.com": 0,
+    "/htt://example.com": 0,
+    "https://example": 1,
+    "https://localhost/2345": 1,
+    "https://localhost:1234/123": 1,
+    "://": 0,
+    "https://": 0,
+    "http://": 0,
+    "ftp://": 0,
+    "ftp://example.com": 0,
+    "https://example.com": 1,
+    "https://example.com/": 1,
+    "https://a.example.com": 1,
+    "https://a.example.com/": 1,
+    "https://a.example.com/what/is/happening.html": 1,
+    "https://a.example.com/what/ís/happening.html": 1,
+    "https://a.example.com/what/is/happening.html?what=1&2%20b#höw-about-this=1a": 1,
+    "https://a.example.com/what/is/happéning/?what=1&2%20b#how-aboüt-this=1a": 1,
+    "HTtpS://a.example.com/what/is/happening/?what=1&2%20b#how-about-this=1af&2f%20b": 1,
+    "https://example.com/?what=1#how-about-this=1&2%20baf": 1,
+    "https://example.com?what=1#how-about-this=1&2%20baf": 1,
+    "<test>http://example7.com</test>": 1,
+    "https://<test>": 0,
+    "https://[test]": 0,
+    'http://"test"': 0,
+    "http://'test'": 0,
+    "[https://example8.com/what/is/this.php?what=1]": 1,
+    "[and http://example9.com?what=1&other=3#and-thing=2]": 1,
+    '<what>https://example10.com#and-thing=2 "</about>': 1,
+    'abc<this["https://example11.com/what/is#and-thing=2?whoami=23&where=1"]that>def': 1,
+    "sdflkf[what](https://example12.com/who/what.php?whoami=1#whatami=2)?am=hi": 1,
+    "<or>http://examplehttp://15.badc</that>": 2,
+    "https://a.example.com/one.html?url=http://example.com/inside/of/another?=http://": 2,
+    "[https://a.example.com/one.html?url=http://example.com/inside/of/another?=](http://a.example.com)": 3,
+}
+
+
+@pytest.mark.parametrize("url_str,num_urls", list(URL_REGEX_COUNT_CASES.items()))
+def test_find_all_urls_count(url_str, num_urls):
+    assert len(list(find_all_urls(url_str))) == num_urls
+
+
+APOSTROPHE_URL = "https://aaib.gov.in/What's%20New%20Assets/Preliminary%20Report%20VT-EXO.pdf"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (APOSTROPHE_URL, APOSTROPHE_URL),
+        (f'"{APOSTROPHE_URL}"', APOSTROPHE_URL),
+        (f"[Report]({APOSTROPHE_URL})", APOSTROPHE_URL),
+        (f'<a href="{APOSTROPHE_URL}">Report</a>', APOSTROPHE_URL),
+        ("https://example.com/?q='quoted'", "https://example.com/?q='quoted'"),
+        ("https://example.com/rock'n'roll", "https://example.com/rock'n'roll"),
+        ("https://example.com/What's_(new)).text", "https://example.com/What's_(new)"),
+        ("'https://example.com/path'after", "https://example.com/path"),
+        ("<a href='https://example.com/path'>Link</a>", "https://example.com/path"),
+        ("https://example.com/path'", "https://example.com/path"),
+        ("https://example.com/path'.", "https://example.com/path"),
+        ("https://example.com/path'><img", "https://example.com/path"),
+        ("&apos;https://example.com/path&apos;after", "https://example.com/path"),
+        ("https://example.com/What&#39;s", "https://example.com/What's"),
+        ("https://example.com/What's%27next", "https://example.com/What's%27next"),
+        ("'what about a case like this https://example.com'?", "https://example.com"),
+        ("'what about a case like this [link](https://example.com)'?", "https://example.com"),
+        ("'what about https://example.com/What's'?", "https://example.com/What's"),
+        ("\"https://example.com/O'Reilly's\"", "https://example.com/O'Reilly's"),
+        ("'https://example.com/O'Reilly's'", "https://example.com/O'Reilly's"),
+        ("'https://example.com/What's'", "https://example.com/What's"),
+        ("See 'https://example.com/O'Reilly's'", "https://example.com/O'Reilly's"),
+        ("See ‘https://example.com/l’été’", "https://example.com/l’été"),
+        ("'https://example.com/O''Reilly''s',title", "https://example.com/O'Reilly's"),
+        ("'https://example.com/dogs''',title", "https://example.com/dogs'"),
+        ("<a href='https://example.com/dogs&#39;'>Link</a>", "https://example.com/dogs'"),
+        ('<a href="https://example.com/dogs\'">Link</a>', "https://example.com/dogs'"),
+        ("https://example.com/'one'/'two'", "https://example.com/'one'/'two'"),
+        ("https://example.com/O'Reilly's?query=that's#what's-new", "https://example.com/O'Reilly's?query=that's#what's-new"),
+        ("[Report](https://example.com/What's_(new) 'A title')", "https://example.com/What's_(new)"),
+        ("<https://example.com/What's>", "https://example.com/What's"),
+        ("https://example.com/l’été", "https://example.com/l’été"),
+        ("‘https://example.com/page’", "https://example.com/page"),
+        ("‘see https://example.com/l’été’!", "https://example.com/l’été"),
+        ("https://example.com/?q=‘word’", "https://example.com/?q=‘word’"),
+        ("https://o'reilly:secret@example.com/path", "https://o'reilly:secret@example.com/path"),
+    ],
+)
+def test_find_all_urls_distinguishes_apostrophes_from_quotes(text, expected):
+    assert list(find_all_urls(text)) == [expected]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        APOSTROPHE_URL,
+        "https://example.com/?q='quoted'",
+        "https://example.com/rock'n'roll",
+        "https://example.com/dogs'",
+        "https://example.com/two''",
+    ],
+)
+def test_sanitize_extracted_url_preserves_apostrophes(url):
+    assert sanitize_extracted_url(url) == url
+
+
+def test_quoted_sentence_with_markdown_link():
+    text = "'what about a case like this [https://example.com](https://example.com)'?"
+    assert set(find_all_urls(text)) == {"https://example.com"}

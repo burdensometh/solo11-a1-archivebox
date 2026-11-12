@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+{% load core_tags %}
+<html lang="en">
+    <head>
+        <title>Archived Sites</title>
+        <meta charset="utf-8" name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+    <body>
+        <table id="table-bookmarks">
+            <thead>
+                <tr class="thead-tr">
+                    <th class="snapshot-time">Saved</th>
+                    <th class="snapshot-preview-cell">Preview</th>
+                    <th>Snapshot ({{num_links}})</th>
+                    <th class="snapshot-tags-cell">Tags</th>
+                    <th class="snapshot-status-cell">Status</th>
+                    <th class="snapshot-files-cell">Files</th>
+                    <th class="snapshot-size-cell">Size</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for link in links %}
+                    {% snapshot_index_row link %}
+                {% endfor %}
+            </tbody>
+        </table>
+    </body>
+</html>

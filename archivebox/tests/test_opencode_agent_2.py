@@ -1,0 +1,12 @@
+"""Run plugin-owned host integration cases in the ArchiveBox CI matrix."""
+
+from abx_plugins.plugins.opencode.archivebox.agent_2_cases import (
+    pytestmark as pytestmark,
+    test_opencode_disabled_route_does_not_start_server as test_opencode_disabled_route_does_not_start_server,
+    test_opencode_agent_requires_superuser_when_enabled as test_opencode_agent_requires_superuser_when_enabled,
+    test_opencode_agent_superuser_gets_admin_wrapper as test_opencode_agent_superuser_gets_admin_wrapper,
+    test_opencode_static_assets_cache_privately_and_revalidate as test_opencode_static_assets_cache_privately_and_revalidate,
+    test_opencode_proxy_sse_response_is_unbuffered as test_opencode_proxy_sse_response_is_unbuffered,
+    test_opencode_proxy_sse_returns_headers_before_restart_finishes as test_opencode_proxy_sse_returns_headers_before_restart_finishes,
+    test_opencode_invalid_state_does_not_break_archivebox as test_opencode_invalid_state_does_not_break_archivebox,
+)

@@ -1,0 +1,567 @@
+__package__ = "archivebox.misc"
+
+# Bootable utility functions (URL parsing, date parsing, JSON encoding, decorators).
+# MUST NOT import archivebox.config, archivebox.core, or Django — this module is
+# loaded by hooks.py and other early code paths. Only depends on stdlib and the
+# bootable .logging module and standalone abx_plugins URL helpers. Unicode
+# hostname conversion lazily uses the already-required pydantic-core URL parser.
+
+import re
+import json as pyjson
+import http.cookiejar
+from decimal import Decimal, InvalidOperation
+
+from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Callable
+from pathlib import Path
+from inspect import signature
+from functools import wraps
+from urllib.parse import urlparse, urlsplit, quote, unquote
+from html import escape, unescape
+from datetime import datetime, timezone
+
+from abx_plugins.plugins.base.url_cleaning import URL_REGEX, fix_url_from_markdown
+from abx_plugins.plugins.base.url_cleaning import sanitize_extracted_url as sanitize_plugin_url
+
+from .logging import COLOR_DICT
+
+if TYPE_CHECKING:
+    from archivebox.config.common import ArchiveBoxBaseConfig
+
+
+def filter_queryset_by_uuid_substring(queryset, slug: str, field: str = "id"):
+    """Filter a queryset to UUID-column matches by prefix or suffix (case-insensitive).
+
+    Avoids ``id__icontains`` (an unindexed full-table scan over the UUID column) by
+    stripping non-hex chars from ``slug`` and matching with ``istartswith`` /
+    ``iendswith``. Returns an empty queryset for inputs with fewer than 8 hex chars
+    to avoid overly broad matches. A full 32-char hex string falls back to an
+    exact-equality lookup.
+    """
+    from django.db.models import Q
+
+    normalized = re.sub(r"[^0-9a-fA-F]", "", slug or "").lower()
+    if len(normalized) < 8:
+        return queryset.none()
+    if len(normalized) == 32:
+        return queryset.filter(**{field: normalized})
+    prefix = f"{field}__istartswith"
+    suffix = f"{field}__iendswith"
+    return queryset.filter(Q(**{prefix: normalized}) | Q(**{suffix: normalized}))
+
+
+### Parsing Helpers
+
+# All of these are (str) -> str
+# shortcuts to: https://docs.python.org/3/library/urllib.parse.html#url-parsing
+scheme = lambda url: urlparse(url).scheme.lower()
+without_scheme = lambda url: urlparse(url)._replace(scheme="").geturl().strip("//")
+without_query = lambda url: urlparse(url)._replace(query="").geturl().strip("//")
+without_fragment = lambda url: urlparse(url)._replace(fragment="").geturl().strip("//")
+without_path = lambda url: urlparse(url)._replace(path="", fragment="", query="").geturl().strip("//")
+path = lambda url: urlparse(url).path
+basename = lambda url: urlparse(url).path.rsplit("/", 1)[-1]
+domain = lambda url: urlparse(url).netloc
+query = lambda url: urlparse(url).query
+fragment = lambda url: urlparse(url).fragment
+extension = lambda url: basename(url).rsplit(".", 1)[-1].lower() if "." in basename(url) else ""
+base_url = lambda url: without_scheme(url)  # uniq base url used to dedupe links
+
+urlencode = lambda s: s and quote(s, encoding="utf-8", errors="replace")
+urldecode = lambda s: s and unquote(s)
+htmlencode = lambda s: s and escape(s, quote=True)
+htmldecode = lambda s: s and unescape(s)
+
+
+def sanitize_html_text(value: Any) -> str:
+    """Strip all HTML from user-editable text before storing it."""
+    if value is None:
+        return ""
+    import bleach
+
+    return bleach.clean(
+        str(value),
+        tags=[],
+        attributes={},
+        protocols=[],
+        strip=True,
+        strip_comments=True,
+    )
+
+
+def ts_to_date_str(ts: Any) -> str | None:
+    parsed = parse_date(ts)
+    return None if parsed is None else parsed.strftime("%Y-%m-%d %H:%M")
+
+
+COLOR_REGEX = re.compile(r"\[(?P<arg_1>\d+)(;(?P<arg_2>\d+)(;(?P<arg_3>\d+))?)?m")
+
+
+# Maximum supported URL length. Very long URLs are rare but must be supported correctly
+# (e.g. data: URLs, deeply nested query strings). The Snapshot.url column is stored as a
+# variable-length TextField (so short URLs don't reserve space and very long URLs still
+# fit) while keeping a normal index on the field so exact, prefix, and substring lookups
+# all keep working.
+MAX_URL_LENGTH = 65535
+
+FILESIZE_UNITS: dict[str, int] = {
+    "": 1,
+    "b": 1,
+    "byte": 1,
+    "bytes": 1,
+    "k": 1024,
+    "kb": 1024,
+    "kib": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "mib": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+    "gib": 1024**3,
+    "t": 1024**4,
+    "tb": 1024**4,
+    "tib": 1024**4,
+}
+
+
+def sanitize_extracted_url(url: str) -> str:
+    """Use the standalone parser's quote rules, then trim dangling prose punctuation."""
+    cleaned = sanitize_plugin_url(url)
+    return cleaned.rstrip('.,;:!?\\"')
+
+
+def validate_url_length(url: str) -> str:
+    if len(url) > MAX_URL_LENGTH:
+        raise ValueError(f"URL is too long ({len(url)} characters). Maximum length is {MAX_URL_LENGTH} characters.")
+    return url
+
+
+def validate_url(url: str) -> str:
+    url = (url or "").strip()
+    if "\n" in url or "\r" in url:
+        raise ValueError("URL must be a single line.")
+    if url.lower().startswith(("webcal://", "webcals://")):
+        url = sanitize_plugin_url(url)
+    url = validate_url_length(url)
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL must start with http:// or https:// and include a hostname.")
+    # urllib validates numeric/range constraints only when the port is accessed.
+    _ = parsed.port
+    return url
+
+
+# Snapshot URLs are stored and shown as submitted, so the same resource can
+# exist as an IRI (https://münchen.de/über) or as its URI (https://xn--mnchen-
+# 3ya.de/%C3%BCber): browsers send the URI, Django decodes request paths back to
+# Unicode, Chrome reports outlinks encoded, and users paste either. These are
+# ArchiveBox's one place for converting between the two; compare, dedupe and
+# look up URLs through them instead of comparing raw strings. The conversion
+# mirrors abx_plugins.plugins.base.utils.iri_to_uri, which hooks use on the wire.
+
+# RFC 3986 reserved delimiters plus "%" so existing escapes are not re-encoded.
+_URI_SAFE_CHARS = "!#$%&'()*+,/:;=?@[]~"
+# Inside a userinfo component ":" and "@" are data, not delimiters.
+_USERINFO_SAFE_CHARS = "!$%&'()*+,;=~"
+# A run of escaped bytes that may spell non-ASCII UTF-8 text.
+_ESCAPED_NON_ASCII = re.compile(r"(?:%[89a-fA-F][0-9a-fA-F])+")
+
+
+def _split_netloc(netloc: str) -> tuple[str, str, str, str]:
+    """Split a netloc into (userinfo + "@", host, ":" + port) the way browsers do."""
+    userinfo, at, hostport = netloc.rpartition("@")
+    host, port = hostport, ""
+    # IPv6 literals are ASCII, and their colons are not a port separator.
+    if not hostport.startswith("[") and ":" in hostport:
+        host, colon, port = hostport.rpartition(":")
+        port = colon + port
+    return userinfo, at, host, port
+
+
+def iri_to_uri(url: str) -> str:
+    """Return the ASCII URI a browser would request for a (possibly Unicode) URL.
+
+    Unicode hostnames use pydantic-core's WHATWG URL parser, preserving ß/ς
+    and emoji while rejecting invalid combining characters and joiners.
+    Invalid hostnames raise ValueError. Userinfo is escaped per
+    component; everything else outside the URI grammar is UTF-8 percent-encoded.
+    Delimiters and existing %XX escapes are kept, so ASCII URLs are unchanged.
+    """
+    netloc = urlsplit(url).netloc
+    userinfo, at, host, port = _split_netloc(netloc)
+    if at:
+        username, colon, password = userinfo.partition(":")
+        userinfo = quote(username, safe=_USERINFO_SAFE_CHARS) + colon + quote(password, safe=_USERINFO_SAFE_CHARS)
+    if not host.isascii():
+        from pydantic_core import Url
+
+        host = cast(str, Url(f"https://{host}/").host)
+    ascii_netloc = f"{userinfo}{at}{host}{port}"
+    if ascii_netloc != netloc:
+        url = url.replace(netloc, ascii_netloc, 1)
+    return quote(url, safe=_URI_SAFE_CHARS)
+
+
+def uri_to_iri(url: str) -> str:
+    """Return the readable IRI for a URI (RFC 3987 section 3.2).
+
+    Decodes only what a browser address bar shows decoded: escapes that spell
+    non-ASCII UTF-8 text and xn-- host labels. ASCII escapes such as %20,
+    %2F or %26 stay encoded because decoding them changes the URL.
+    """
+    netloc = urlsplit(url).netloc
+    userinfo, at, host, port = _split_netloc(netloc)
+    if "xn--" in host.lower():
+        labels = []
+        for label in host.split("."):
+            if label.lower().startswith("xn--"):
+                try:
+                    label = label[4:].encode("ascii").decode("punycode")
+                except UnicodeError:
+                    pass
+            labels.append(label)
+        unicode_netloc = f"{userinfo}{at}{'.'.join(labels)}{port}"
+        url = url.replace(netloc, unicode_netloc, 1)
+
+    def decode(match: re.Match[str]) -> str:
+        try:
+            return unquote(match[0], errors="strict")
+        except UnicodeDecodeError:
+            return match[0]
+
+    return _ESCAPED_NON_ASCII.sub(decode, url)
+
+
+def equivalent_urls(url: str) -> list[str]:
+    """Spellings of one URL that may be stored: as given, as URI, and as IRI.
+
+    Use for exact lookups (``url__in=equivalent_urls(url)``) so a snapshot
+    saved in one form is found, deduped and replayed when requested in another.
+    """
+    try:
+        uri = iri_to_uri(url)
+    except ValueError:
+        # Search uses this helper for literal text too. Malformed URL-looking
+        # text has no URI variants, but must still match titles/notes verbatim.
+        return [url]
+    iri = uri_to_iri(uri)
+    # Some spellings need ASCII escapes decoded too (a raw space typed in a
+    # password is %20 in the URI). Decoding everything can also change the
+    # URL (%26 -> &), so keep that spelling only if it still encodes back.
+    decoded = unquote(iri)
+    forms = (url, uri, iri, decoded) if iri_to_uri(decoded) == uri else (url, uri, iri)
+    return list(dict.fromkeys(forms))
+
+
+def parens_are_matched(string: str, open_char="(", close_char=")"):
+    """check that all parentheses in a string are balanced and nested properly"""
+    count = 0
+    for c in string:
+        if c == open_char:
+            count += 1
+        elif c == close_char:
+            count -= 1
+        if count < 0:
+            return False
+    return count == 0
+
+
+def split_comma_separated_urls(url: str):
+    offset = 0
+    while True:
+        http_index = url.find("http://", 1)
+        https_index = url.find("https://", 1)
+        next_indices = [idx for idx in (http_index, https_index) if idx != -1]
+        if not next_indices:
+            yield offset, url
+            return
+
+        next_index = min(next_indices)
+        if url[next_index - 1] != ",":
+            yield offset, url
+            return
+
+        yield offset, url[: next_index - 1]
+        offset += next_index
+        url = url[next_index:]
+
+
+def find_all_urls(urls_str: str):
+    skipped_starts = set()
+    for match in re.finditer(URL_REGEX, urls_str):
+        if match.start() in skipped_starts:
+            continue
+
+        cleaned_match = fix_url_from_markdown(match.group(1), preceding_text=urls_str[max(0, match.start(1) - 6) : match.start(1)])
+        cleaned_match = sanitize_extracted_url(cleaned_match)
+        for offset, url in split_comma_separated_urls(cleaned_match):
+            if offset:
+                skipped_starts.add(match.start() + offset)
+            yield url
+
+
+def parse_filesize_to_bytes(value: str | int | float | None) -> int:
+    """
+    Parse a byte count from an integer or human-readable string like 45mb or 2 GB.
+    """
+    if value is None:
+        return 0
+
+    if isinstance(value, bool):
+        raise ValueError("Size value must be an integer or size string.")
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("Size value must resolve to a whole number of bytes.")
+        return int(value)
+
+    raw_value = str(value).strip()
+    if not raw_value:
+        return 0
+
+    if raw_value.isdigit():
+        return int(raw_value)
+
+    match = re.fullmatch(r"(?i)(\d+(?:\.\d+)?)\s*([a-z]+)", raw_value)
+    if not match:
+        raise ValueError(f"Invalid size value: {value}")
+
+    amount_str, unit_str = match.groups()
+    multiplier = FILESIZE_UNITS.get(unit_str.lower())
+    if multiplier is None:
+        raise ValueError(f"Unknown size unit: {unit_str}")
+
+    try:
+        amount = Decimal(amount_str)
+    except InvalidOperation as err:
+        raise ValueError(f"Invalid size value: {value}") from err
+
+    return int(amount * multiplier)
+
+
+def enforce_types(func):
+    """
+    Enforce function arg and kwarg types at runtime using its python3 type hints
+    Simpler version of pydantic @validate_call decorator
+    """
+    # TODO: check return type as well
+
+    @wraps(func)
+    def typechecked_function(*args, **kwargs):
+        sig = signature(func)
+
+        def check_argument_type(arg_key, arg_val):
+            try:
+                annotation = sig.parameters[arg_key].annotation
+            except KeyError:
+                annotation = None
+
+            if annotation is not None and annotation.__class__ is type:
+                if not isinstance(arg_val, annotation):
+                    raise TypeError(
+                        "{}(..., {}: {}) got unexpected {} argument {}={}".format(
+                            func.__name__,
+                            arg_key,
+                            annotation.__name__,
+                            type(arg_val).__name__,
+                            arg_key,
+                            str(arg_val)[:64],
+                        ),
+                    )
+
+        # check args
+        for arg_val, arg_key in zip(args, sig.parameters):
+            check_argument_type(arg_key, arg_val)
+
+        # check kwargs
+        for arg_key, arg_val in kwargs.items():
+            check_argument_type(arg_key, arg_val)
+
+        return func(*args, **kwargs)
+
+    return typechecked_function
+
+
+def docstring(text: str | None):
+    """attach the given docstring to the decorated function"""
+
+    def decorator(func):
+        if text:
+            func.__doc__ = text
+        return func
+
+    return decorator
+
+
+@enforce_types
+def parse_date(date: Any) -> datetime | None:
+    """Parse unix timestamps, iso format, and human-readable strings"""
+
+    if date is None:
+        return None
+
+    if isinstance(date, datetime):
+        if date.tzinfo is None:
+            return date.replace(tzinfo=timezone.utc)
+
+        # Legacy SQLite ArchiveResult rows can retain explicit timezone offsets
+        # through migration. Django loads those as aware datetimes, whereas JSON
+        # imports reach the string branch below. Normalize both representations
+        # consistently so opening a migrated snapshot does not raise (#1889).
+        # Convert the instant; replacing tzinfo here would shift the capture time.
+        return date.astimezone(timezone.utc)
+
+    if isinstance(date, (float, int)):
+        date = str(date)
+
+    if isinstance(date, str):
+        normalized = date.strip()
+        if not normalized:
+            raise ValueError(f"Tried to parse invalid date string! {date}")
+
+        try:
+            return datetime.fromtimestamp(float(normalized), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            pass
+
+        try:
+            iso_date = normalized.replace("Z", "+00:00")
+            parsed_date = datetime.fromisoformat(iso_date)
+            if parsed_date.tzinfo is None:
+                return parsed_date.replace(tzinfo=timezone.utc)
+            return parsed_date.astimezone(timezone.utc)
+        except ValueError:
+            pass
+
+        from dateparser import parse as dateparser
+
+        parsed_date = dateparser(normalized, settings={"TIMEZONE": "UTC"})
+        if parsed_date is None:
+            raise ValueError(f"Tried to parse invalid date string! {date}")
+        return parsed_date.astimezone(timezone.utc)
+
+    raise ValueError(f"Tried to parse invalid date! {date}")
+
+
+@enforce_types
+def download_url(url: str, timeout: int | None = None, config: "ArchiveBoxBaseConfig | None" = None, **config_kwargs) -> str:
+    """Download the contents of a remote url and return the text"""
+
+    import requests
+    from abx_plugins.plugins.base.utils import resolve_user_agent
+    from w3lib.encoding import html_body_declared_encoding, http_content_type_encoding
+
+    from archivebox.config.common import get_config
+
+    config = config or get_config(**config_kwargs)
+    timeout = timeout or config.TIMEOUT
+    session = requests.Session()
+
+    if config.COOKIES_FILE and Path(config.COOKIES_FILE).is_file():
+        cookie_jar = http.cookiejar.MozillaCookieJar(config.COOKIES_FILE)
+        cookie_jar.load(ignore_discard=True, ignore_expires=True)
+        for cookie in cookie_jar:
+            if cookie.value is not None:
+                session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+
+    response = session.get(
+        url,
+        headers={"User-Agent": resolve_user_agent({"USER_AGENT": config.USER_AGENT, "ABXPKG_LIB_DIR": str(config.ABXPKG_LIB_DIR)}) or None},
+        verify=config.CHECK_SSL_VALIDITY,
+        timeout=timeout,
+    )
+
+    content_type = response.headers.get("Content-Type", "")
+    encoding = http_content_type_encoding(content_type) or html_body_declared_encoding(response.text)
+
+    if encoding is not None:
+        response.encoding = encoding
+
+    try:
+        return response.text
+    except UnicodeDecodeError:
+        # if response is non-test (e.g. image or other binary files), just return the filename instead
+        return url.rsplit("/", 1)[-1]
+
+
+@enforce_types
+def ansi_to_html(text: str) -> str:
+    """
+    Based on: https://stackoverflow.com/questions/19212665/python-converting-ansi-color-codes-to-html
+    Simple way to render colored CLI stdout/stderr in HTML properly, Textual/rich is probably better though.
+    """
+
+    TEMPLATE = '<span style="color: rgb{}"><br>'
+    text = text.replace("[m", "</span>")
+
+    def single_sub(match):
+        argsdict = match.groupdict()
+        if argsdict["arg_3"] is None:
+            if argsdict["arg_2"] is None:
+                _, color = 0, argsdict["arg_1"]
+            else:
+                _, color = argsdict["arg_1"], argsdict["arg_2"]
+        else:
+            _, color = argsdict["arg_3"], argsdict["arg_2"]
+
+        return TEMPLATE.format(COLOR_DICT[color][0])
+
+    return COLOR_REGEX.sub(single_sub, text)
+
+
+class ExtendedEncoder(pyjson.JSONEncoder):
+    """
+    Extended json serializer that supports serializing several model
+    fields and objects
+    """
+
+    def default(self, o):
+        cls_name = o.__class__.__name__
+
+        if isinstance(o, tuple) and "_asdict" in vars(type(o)):
+            return o._asdict()
+
+        elif isinstance(o, bytes):
+            return o.decode()
+
+        elif isinstance(o, datetime):
+            return o.isoformat()
+
+        elif isinstance(o, Exception):
+            return f"{o.__class__.__name__}: {o}"
+
+        elif isinstance(o, Path):
+            return str(o)
+
+        elif cls_name in ("dict_items", "dict_keys", "dict_values"):
+            return list(o)
+
+        elif isinstance(o, Callable):
+            return str(o)
+
+        # Try dict/list conversion as fallback
+        try:
+            return dict(o)
+        except Exception:
+            pass
+
+        try:
+            return list(o)
+        except Exception:
+            pass
+
+        try:
+            return str(o)
+        except Exception:
+            pass
+
+        return pyjson.JSONEncoder.default(self, o)
+
+
+@enforce_types
+def to_json(obj: Any, indent: int | None = 4, sort_keys: bool = True) -> str:
+    """Serialize object to JSON string with extended type support"""
+    return pyjson.dumps(obj, indent=indent, sort_keys=sort_keys, cls=ExtendedEncoder)

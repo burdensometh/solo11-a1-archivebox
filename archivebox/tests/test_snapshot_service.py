@@ -1,0 +1,359 @@
+import json
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+from django.db import close_old_connections
+
+from archivebox.core.models import ArchiveResult, Snapshot
+from archivebox.tests.conftest import run_archivebox_cmd
+from archivebox.tests.test_orm_helpers import use_archivebox_db
+from .conftest import (
+    cli_env,
+    get_free_port,
+    init_archive,
+)
+
+pytestmark = pytest.mark.django_db(transaction=True)
+
+
+def _snapshot_state(cwd: Path, url: str) -> dict[str, object]:
+    with use_archivebox_db(cwd):
+        snapshot = Snapshot.objects.select_related("crawl", "crawl__created_by").get(url=url)
+        snapshot_dir = Path(snapshot.output_dir)
+        crawl_dir = Path(snapshot.crawl.output_dir)
+        crawl_link = crawl_dir / "snapshots" / Snapshot.extract_domain_from_url(snapshot.url) / str(snapshot.id)
+        results = list(
+            ArchiveResult.objects.filter(snapshot=snapshot)
+            .order_by("plugin", "hook_name")
+            .values("plugin", "hook_name", "status", "output_files", "output_size"),
+        )
+        return {
+            "id": str(snapshot.id),
+            "crawl_id": str(snapshot.crawl_id),
+            "status": snapshot.status,
+            "retry_at": snapshot.retry_at,
+            "downloaded_at": snapshot.downloaded_at,
+            "output_size": snapshot.output_size,
+            "snapshot_dir": snapshot_dir,
+            "crawl_dir": crawl_dir,
+            "crawl_link": crawl_link,
+            "results": results,
+        }
+
+
+def test_snapshot_completion_preserves_retry_scheduled_during_active_run(tmp_path, admin_user):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from archivebox.crawls.models import Crawl
+    from archivebox.services.snapshot_service import finalize_completed_snapshot, prepare_completed_snapshot
+
+    crawl = Crawl.objects.create(urls="https://example.com/retry-race", created_by=admin_user)
+    owned_retry_at = timezone.now() + timedelta(minutes=10)
+    snapshot = Snapshot.objects.create(
+        url="https://example.com/retry-race",
+        crawl=crawl,
+        status=Snapshot.StatusChoices.STARTED,
+        retry_at=owned_retry_at,
+        config={"RETRY_PLUGINS": ["title"]},
+    )
+    running = ArchiveResult.objects.create(
+        snapshot=snapshot,
+        plugin="title",
+        hook_name="on_Snapshot__10_title.py",
+        status=ArchiveResult.StatusChoices.STARTED,
+        notes="New attempt diagnostics",
+    )
+
+    snapshot.schedule_plugin_run(["title"])
+    assert (
+        prepare_completed_snapshot(
+            str(snapshot.id),
+            owned_retry_at=owned_retry_at,
+            was_sealed=False,
+            error="Old attempt failed",
+        )
+        is None
+    )
+    finalize_completed_snapshot(
+        str(snapshot.id),
+        owned_retry_at=owned_retry_at,
+        was_sealed=False,
+        consumed_retry_plugins=["title"],
+        error="Old attempt failed",
+    )
+
+    snapshot.refresh_from_db()
+    assert snapshot.status == Snapshot.StatusChoices.QUEUED
+    assert snapshot.retry_at is not None
+    assert snapshot.retry_at < owned_retry_at
+    assert snapshot.config["RETRY_PLUGINS"] == ["title"]
+    assert "Old attempt failed" not in snapshot.notes
+    running.refresh_from_db()
+    assert running.status == ArchiveResult.StatusChoices.STARTED
+    assert running.notes == "New attempt diagnostics"
+
+
+def test_sealed_completion_preserves_added_request_with_same_lease(admin_user):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from archivebox.crawls.models import Crawl
+    from archivebox.services.snapshot_service import finalize_completed_snapshot
+
+    crawl = Crawl.objects.create(urls="https://example.com/sealed-retry-race", created_by=admin_user)
+    owned_retry_at = timezone.now() + timedelta(minutes=10)
+    snapshot = Snapshot.objects.create(
+        url=crawl.urls,
+        crawl=crawl,
+        status=Snapshot.StatusChoices.SEALED,
+        retry_at=owned_retry_at,
+        config={"RETRY_PLUGINS": ["title"]},
+    )
+    # The public scheduler permits preserving a future schedule while adding
+    # work. Lease equality alone cannot prove the old request is still current.
+    assert snapshot.schedule_plugin_run(["hashes"], when=owned_retry_at)
+    finalize_completed_snapshot(
+        str(snapshot.id),
+        owned_retry_at=owned_retry_at,
+        was_sealed=True,
+        consumed_retry_plugins=["title"],
+    )
+
+    snapshot.refresh_from_db()
+    assert snapshot.status == Snapshot.StatusChoices.SEALED
+    assert snapshot.config["RETRY_PLUGINS"] == ["hashes", "title"]
+    assert snapshot.retry_at == owned_retry_at
+
+
+@pytest.mark.parametrize("maintenance", [False, True])
+@pytest.mark.parametrize("change", ["edit", "published-error", "new-error"])
+def test_completion_preserves_published_date_without_backdating_new_metadata(admin_user, maintenance, change):
+    from django.utils import timezone
+
+    from archivebox.crawls.models import Crawl
+    from archivebox.services.snapshot_service import finalize_completed_snapshot
+
+    crawl = Crawl.objects.create(urls="https://example.com/metadata-date", created_by=admin_user)
+    snapshot = Snapshot.objects.create(
+        url=crawl.urls,
+        crawl=crawl,
+        status=Snapshot.StatusChoices.SEALED if maintenance else Snapshot.StatusChoices.STARTED,
+        retry_at=timezone.now(),
+        config={"RETRY_PLUGINS": ["title"]} if maintenance else {},
+        notes="Capture failed" if change == "published-error" else "",
+    )
+    published_modified_at = snapshot.modified_at
+    if change == "edit":
+        # Publication cannot overwrite a newer user edit's revision date.
+        snapshot.title = "Edited title"
+        snapshot.save(update_fields=["title", "modified_at"])
+    current_modified_at = snapshot.modified_at
+    finalize_completed_snapshot(
+        str(snapshot.id),
+        owned_retry_at=snapshot.retry_at,
+        was_sealed=maintenance,
+        consumed_retry_plugins=["title"] if maintenance else [],
+        published_modified_at=published_modified_at,
+        error="Capture failed" if change != "edit" else "",
+    )
+    snapshot.refresh_from_db()
+    assert snapshot.status == Snapshot.StatusChoices.SEALED
+    assert snapshot.retry_at is None
+    assert "RETRY_PLUGINS" not in snapshot.config
+    if change == "published-error":
+        assert snapshot.modified_at == published_modified_at
+    elif change == "edit":
+        assert snapshot.title == "Edited title"
+        assert snapshot.modified_at == current_modified_at > published_modified_at
+    else:
+        assert snapshot.notes == "Capture failed"
+        assert snapshot.modified_at > published_modified_at
+
+
+def test_concurrent_plugin_scheduling_durably_merges_every_request(admin_user):
+    from archivebox.crawls.models import Crawl
+    from django.db import connection
+
+    if connection.vendor != "sqlite":
+        pytest.skip("exercises SQLite concurrent-writer scheduling")
+
+    crawl = Crawl.objects.create(urls="https://example.com/plugin-race", created_by=admin_user)
+    snapshot = Snapshot.objects.create(url="https://example.com/plugin-race", crawl=crawl)
+    plugins = ["title", "wget", "screenshot", "pdf"]
+
+    def schedule(plugin: str) -> bool:
+        close_old_connections()
+        try:
+            return Snapshot.objects.get(pk=snapshot.pk).schedule_plugin_run([plugin])
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=len(plugins)) as pool:
+        results = list(pool.map(schedule, plugins))
+
+    snapshot.refresh_from_db()
+    assert results == [True] * len(plugins)
+    assert snapshot.config["RETRY_PLUGINS"] == sorted(plugins)
+
+
+def test_snapshot_keyset_iterator_reads_more_than_eight_pages(admin_user):
+    from archivebox.crawls.models import Crawl
+
+    crawl = Crawl.objects.create(urls="https://example.com/pages", created_by=admin_user)
+    snapshots = [Snapshot.objects.create(url=f"https://example.com/pages/{idx}", crawl=crawl) for idx in range(10)]
+
+    yielded_ids = [snapshot.id for snapshot in crawl.snapshot_set.order_by("id").paged_iterator(chunk_size=1)]
+
+    assert yielded_ids == sorted(snapshot.id for snapshot in snapshots)
+
+
+def test_snapshot_merge_consolidates_only_exact_hook_identity(admin_user):
+    from archivebox.crawls.models import Crawl
+
+    keeper_crawl = Crawl.objects.create(urls="https://example.com", created_by=admin_user)
+    duplicate_crawl = Crawl.objects.create(urls="https://example.com", created_by=admin_user)
+    keeper = Snapshot.objects.create(url="https://example.com", crawl=keeper_crawl)
+    duplicate = Snapshot.objects.create(url="https://example.com", crawl=duplicate_crawl)
+    ArchiveResult.objects.create(
+        snapshot=keeper,
+        plugin="archivewebpage",
+        hook_name="on_Snapshot__65_archivewebpage_stop",
+        status=ArchiveResult.StatusChoices.NORESULTS,
+        output_files={"older.wacz": {"size": 5}},
+        output_size=5,
+    )
+    ArchiveResult.objects.create(
+        snapshot=duplicate,
+        plugin="archivewebpage",
+        hook_name="on_Snapshot__65_archivewebpage_stop",
+        status=ArchiveResult.StatusChoices.SUCCEEDED,
+        output_str="archivewebpage.wacz",
+        output_files={"archivewebpage.wacz": {"size": 7}},
+        output_size=7,
+    )
+    ArchiveResult.objects.create(
+        snapshot=duplicate,
+        plugin="archivewebpage",
+        hook_name="on_Snapshot__16_archivewebpage_start",
+        status=ArchiveResult.StatusChoices.SUCCEEDED,
+        output_str="recording started",
+    )
+
+    Snapshot._merge_snapshots([keeper, duplicate])
+
+    assert not Snapshot.objects.filter(pk=duplicate.pk).exists()
+    results = ArchiveResult.objects.filter(snapshot=keeper, plugin="archivewebpage")
+    assert results.count() == 2
+    stop_result = results.get(hook_name="on_Snapshot__65_archivewebpage_stop")
+    assert stop_result.status == ArchiveResult.StatusChoices.SUCCEEDED
+    assert stop_result.output_str == "archivewebpage.wacz"
+    assert set(stop_result.output_files) == {"older.wacz", "archivewebpage.wacz"}
+    assert results.filter(hook_name="on_Snapshot__16_archivewebpage_start").exists()
+
+
+@pytest.mark.timeout(180)
+def test_snapshot_service_cli_add_seals_snapshot_and_writes_indexes(tmp_path, recursive_test_site):
+    init_archive(tmp_path)
+
+    port = get_free_port()
+    env = cli_env(port=port, server=True, PLUGINS="wget", SAVE_WGET="True")
+    command_result = run_archivebox_cmd(
+        ["add", "--depth=0", "--plugins=wget", recursive_test_site["root_url"]],
+        cwd=tmp_path,
+        env=env,
+        timeout=180,
+    )
+    assert command_result.returncode == 0, (
+        f"archivebox add failed with code {command_result.returncode}\nSTDOUT:\n{command_result.stdout}\nSTDERR:\n{command_result.stderr}"
+    )
+
+    state = _snapshot_state(tmp_path, recursive_test_site["root_url"])
+    snapshot_dir = state["snapshot_dir"]
+    crawl_link = state["crawl_link"]
+    assert isinstance(snapshot_dir, Path)
+    assert isinstance(crawl_link, Path)
+
+    assert state["status"] == Snapshot.StatusChoices.SEALED
+    assert state["retry_at"] is None
+    assert state["downloaded_at"] is not None
+    assert snapshot_dir.is_dir()
+    assert crawl_link.is_symlink()
+    assert crawl_link.resolve() == snapshot_dir.resolve()
+
+    index_jsonl = snapshot_dir / "index.jsonl"
+    assert index_jsonl.is_file()
+
+    records = [json.loads(line) for line in index_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert records[0]["type"] == "Snapshot"
+    assert records[0]["id"] == state["id"]
+    with use_archivebox_db(tmp_path):
+        assert records[0] == Snapshot.objects.get(pk=state["id"]).to_json()
+    assert any(record.get("type") == "ArchiveResult" and record.get("plugin") == "wget" for record in records)
+
+    wget_files = [path for path in (snapshot_dir / "wget").rglob("*") if path.is_file()]
+    assert wget_files
+    assert any("Root" in path.read_text(encoding="utf-8", errors="ignore") for path in wget_files if path.suffix in (".html", ".txt"))
+    assert any(result["plugin"] == "wget" and result["status"] == ArchiveResult.StatusChoices.SUCCEEDED for result in state["results"])
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("depth", [0, 1])
+def test_api_queue_hands_storage_creation_to_runner(tmp_path, recursive_test_site, depth):
+    from .conftest import (
+        create_admin_and_token,
+        live_api_request,
+        stop_archivebox_process,
+        start_archivebox_server,
+        wait_for_snapshot_capture,
+    )
+
+    init_archive(tmp_path)
+    port = get_free_port()
+    env = cli_env(port=port, server=True, PLUGINS="wget,parse_html_urls")
+    token = create_admin_and_token(tmp_path)
+    url = recursive_test_site["root_url"]
+    server = start_archivebox_server(tmp_path, env=env, port=port, log_name="api-storage-handoff.log")
+    try:
+        response = live_api_request(
+            port,
+            "post",
+            "/api/v1/cli/add",
+            api_token=token,
+            json={"urls": [url], "plugins": "wget,parse_html_urls", "tag": "handoff", "depth": depth},
+        )
+        assert response.status_code == 200, response.text
+        crawl_id = response.json()["result"]["crawl_id"]
+        metadata = live_api_request(
+            port,
+            "post",
+            "/api/v1/core/snapshots",
+            api_token=token,
+            json={"crawl_id": crawl_id, "url": url, "title": "Browser title"},
+        )
+        assert metadata.status_code == 200, metadata.text
+        assert "Root" in wait_for_snapshot_capture(tmp_path, url, timeout=120)
+        if depth:
+            assert "About" in wait_for_snapshot_capture(tmp_path, url + "about", timeout=120)
+            child_state = _snapshot_state(tmp_path, url + "about")
+            assert child_state["status"] == Snapshot.StatusChoices.SEALED
+            assert child_state["crawl_link"].is_symlink()
+            assert child_state["crawl_link"].resolve() == child_state["snapshot_dir"].resolve()
+            assert (child_state["snapshot_dir"] / "index.jsonl").is_file()
+        with use_archivebox_db(tmp_path):
+            snapshot = Snapshot.objects.get(pk=metadata.json()["id"])
+            assert snapshot.tags.filter(name="handoff").exists()
+    finally:
+        stop_archivebox_process(server)
+    state = _snapshot_state(tmp_path, url)
+    assert state["status"] == Snapshot.StatusChoices.SEALED
+    assert state["crawl_dir"].is_dir()
+    assert state["snapshot_dir"].is_dir()
+    assert state["crawl_link"].is_symlink()
+    assert state["crawl_link"].resolve() == state["snapshot_dir"].resolve()
+    assert (state["snapshot_dir"] / "index.jsonl").is_file()
+    assert any(row["plugin"] == "wget" and row["status"] == "succeeded" for row in state["results"])
+    assert any("Root" in path.read_text(errors="ignore") for path in (state["snapshot_dir"] / "wget").rglob("*.html"))

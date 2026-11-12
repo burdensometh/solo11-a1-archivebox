@@ -1,0 +1,174 @@
+import os
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from archivebox.config import CONSTANTS
+
+
+def test_sonic_dir_is_allowed_inside_data_dir():
+    assert "sonic" in CONSTANTS.ALLOWED_IN_DATA_DIR
+
+
+def test_runtime_config_model_is_separate_from_source_loading():
+    from pydantic_settings import BaseSettings
+    from archivebox.config.common import ArchiveBoxConfig, ArchiveBoxSourceSettings, get_all_configs
+
+    previous_timeout = os.environ.get("TIMEOUT")
+    try:
+        os.environ["TIMEOUT"] = "1"
+        assert ArchiveBoxSourceSettings().TIMEOUT == 1
+        assert ArchiveBoxConfig().TIMEOUT != 1
+        assert get_all_configs()["ARCHIVING_CONFIG"].TIMEOUT == 1
+        assert not issubclass(ArchiveBoxConfig, BaseSettings)
+        assert issubclass(ArchiveBoxSourceSettings, BaseSettings)
+    finally:
+        if previous_timeout is None:
+            os.environ.pop("TIMEOUT", None)
+        else:
+            os.environ["TIMEOUT"] = previous_timeout
+
+
+def test_runtime_config_validation_matches_source_model_validation():
+    from archivebox.config.common import ArchiveBoxConfig, ArchiveBoxSourceSettings
+
+    payload = ArchiveBoxConfig().model_dump(mode="json")
+    payload.update(
+        {
+            "TIMEOUT": "17",
+            "CHROME_ARGS": ["--headless", "--no-sandbox"],
+            "ABXPKG_LIB_DIR": "./lib-from-resolved-validation",
+        },
+    )
+
+    normally_validated = ArchiveBoxSourceSettings.model_validate(payload)
+    resolved_validated = ArchiveBoxConfig.model_validate(payload)
+
+    assert resolved_validated.model_dump(mode="json") == normally_validated.model_dump(mode="json")
+    assert resolved_validated.model_fields_set == normally_validated.model_fields_set
+
+
+def test_runtime_config_validation_preserves_source_model_errors():
+    from archivebox.config.common import ArchiveBoxConfig, ArchiveBoxSourceSettings
+
+    with pytest.raises(ValidationError) as normal_error:
+        ArchiveBoxSourceSettings.model_validate({"TIMEOUT": "not-an-integer"})
+    with pytest.raises(ValidationError) as resolved_error:
+        ArchiveBoxConfig.model_validate({"TIMEOUT": "not-an-integer"})
+
+    assert resolved_error.value.errors(include_url=False) == normal_error.value.errors(include_url=False)
+
+
+def test_string_config_values_are_decoded_at_one_boundary():
+    from archivebox.config.common import ArchiveBoxConfig
+    from archivebox.config.configset import decode_config_inputs
+
+    decoded = decode_config_inputs(
+        ArchiveBoxConfig,
+        {
+            "CHROME_ARGS": '["--headless", "--no-sandbox"]',
+            "UNKNOWN_COMPLEX": '{"source": "plugin"}',
+        },
+        decode_unknown_json=True,
+    )
+
+    assert decoded["CHROME_ARGS"] == ["--headless", "--no-sandbox"]
+    assert decoded["UNKNOWN_COMPLEX"] == {"source": "plugin"}
+
+
+def test_repeated_config_loads_see_every_env_and_config_file_edit():
+    from archivebox.config.common import ArchiveBoxSourceSettings, get_config, load_source_config
+
+    # A fixed key keeps the random SECRET_KEY default out of the equality checks.
+    os.environ["SECRET_KEY"] = "fixed-secret-for-config-equality"
+    config_file = CONSTANTS.CONFIG_FILE
+
+    def assert_loaded(timeout: int, chrome_args: list[str]) -> None:
+        loaded = load_source_config()
+        assert loaded.model_dump(mode="json") == ArchiveBoxSourceSettings().model_dump(mode="json")
+        assert (loaded.TIMEOUT, loaded.CHROME_ARGS) == (timeout, chrome_args)
+        for resolve_plugins in (False, True):
+            resolved = get_config(include_machine=False, resolve_plugins=resolve_plugins)
+            assert (resolved.TIMEOUT, resolved.CHROME_ARGS) == (timeout, chrome_args)
+        # Callers own their result; mutating it must not leak into later loads.
+        loaded.CHROME_ARGS.append("--mutated-by-caller")
+
+    config_file.write_text('[ARCHIVING_CONFIG]\nTIMEOUT = 11\nCHROME_ARGS = ["--from-file-a"]\n')
+    assert_loaded(11, ["--from-file-a"])
+
+    # Same size and same mtime: only the content changed, which must still be seen.
+    original_stat = config_file.stat()
+    config_file.write_text('[ARCHIVING_CONFIG]\nTIMEOUT = 22\nCHROME_ARGS = ["--from-file-b"]\n')
+    os.utime(config_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    assert config_file.stat().st_size == original_stat.st_size
+    assert_loaded(22, ["--from-file-b"])
+
+    os.environ["TIMEOUT"] = "33"
+    os.environ["CHROME_ARGS"] = '["--from-env"]'
+    assert_loaded(33, ["--from-env"])
+
+    del os.environ["TIMEOUT"]
+    del os.environ["CHROME_ARGS"]
+    assert_loaded(22, ["--from-file-b"])
+
+    config_file.unlink()
+    assert_loaded(ArchiveBoxSourceSettings.model_fields["TIMEOUT"].default, ArchiveBoxSourceSettings().CHROME_ARGS)
+
+
+def test_resolving_scoped_config_does_not_mutate_process_environment(tmp_path):
+    from archivebox.config.common import ArchiveBoxConfig, get_config
+
+    active_lib_dir = tmp_path / "active-lib"
+    stale_lib_dir = tmp_path / "stale-lib"
+    previous_lib_dir = os.environ.get("ABXPKG_LIB_DIR")
+    try:
+        os.environ["ABXPKG_LIB_DIR"] = str(active_lib_dir)
+        stale_process_config = ArchiveBoxConfig(ABXPKG_LIB_DIR=stale_lib_dir)
+
+        resolved = get_config(base_config=stale_process_config, include_machine=False, resolve_plugins=False)
+
+        assert resolved.ABXPKG_LIB_DIR == stale_lib_dir
+        assert os.environ["ABXPKG_LIB_DIR"] == str(active_lib_dir)
+    finally:
+        if previous_lib_dir is None:
+            os.environ.pop("ABXPKG_LIB_DIR", None)
+        else:
+            os.environ["ABXPKG_LIB_DIR"] = previous_lib_dir
+
+
+@pytest.mark.parametrize("key", ["COOKIES_FILE", "AUTH_STORAGE_FILE", "WGET_COOKIES_FILE", "YTDLP_COOKIES_FILE", "GALLERYDL_COOKIES_FILE"])
+def test_cookie_paths_remain_collection_relative_after_runtime_overlays(key, tmp_path):
+    from archivebox.config.common import ArchiveBoxConfig
+
+    config = ArchiveBoxConfig(**{key: "auth/cookies.txt"})
+    assert str(config[key]) == str(CONSTANTS.DATA_DIR / "auth/cookies.txt")
+    runtime = config.for_crawl_runtime(runtime_overrides={key: "other/cookies.txt"})
+    assert runtime[key] == str(CONSTANTS.DATA_DIR / "other/cookies.txt")
+    absolute = tmp_path / "absolute-cookies.txt"
+    config = ArchiveBoxConfig(**{key: str(absolute)})
+    assert str(config[key]) == str(absolute)
+
+
+@pytest.mark.parametrize("key", ["COOKIES_FILE", "AUTH_STORAGE_FILE"])
+@pytest.mark.parametrize("value", ["", "  ", None])
+def test_empty_cookie_path_disables_import(key, value):
+    from archivebox.config.common import ArchiveBoxConfig
+
+    config = ArchiveBoxConfig(**{key: value})
+    assert config[key] is None
+    assert key not in config.for_crawl_runtime()
+
+
+def test_cookie_runtime_path_preserves_configured_symlink(tmp_path):
+    from archivebox.config.common import ArchiveBoxConfig
+
+    export = tmp_path / "export.txt"
+    export.write_text("# Netscape HTTP Cookie File\n")
+    configured = tmp_path / "cookies.txt"
+    configured.symlink_to(export)
+    config = ArchiveBoxConfig(COOKIES_FILE=configured)
+    assert str(config.COOKIES_FILE) == str(configured)
+    runtime = config.for_crawl_runtime()
+    assert runtime["COOKIES_FILE"] == str(configured)
+    assert Path(runtime["COOKIES_FILE"]).read_bytes() == export.read_bytes()

@@ -1,0 +1,885 @@
+from pathlib import Path
+from importlib.resources import files
+import hashlib
+import json
+import os
+import shutil
+
+import pytest
+
+
+from abxpkg.binary_service import BinaryRequestEvent
+from abx_dl.events import ProcessCompletedEvent, ProcessEvent, ProcessStartedEvent, SnapshotEvent
+from abx_dl.orchestrator import create_bus
+from abx_dl.output_files import OutputFile
+from archivebox.tests.conftest import resolve_abxpkg_binary_env
+from archivebox.tests.conftest import install_real_binary
+
+
+pytestmark = pytest.mark.django_db(transaction=True)
+
+
+def _snapshot_hook_name(plugin_name: str) -> str:
+    from archivebox.plugins.discovery import get_plugin_catalog
+
+    plugin = get_plugin_catalog().get(plugin_name)
+    assert plugin is not None, f"missing test plugin {plugin_name}"
+    hooks = plugin.filter_hooks("Snapshot")
+    assert hooks, f"missing Snapshot hooks for {plugin_name}"
+    return hooks[0].name
+
+
+def _cleanup_machine_process_rows() -> None:
+    from archivebox.machine.models import Process
+
+    Process.objects.all().delete()
+
+
+def _run_shipped_snapshot_hook(
+    snapshot,
+    *,
+    plugin: str,
+    hook_name: str,
+    event_hook_name: str | None = None,
+    lib_dir: Path,
+    env: dict | None = None,
+    expected_exit_codes: tuple[int, ...] = (0,),
+    cancel_when=None,
+):
+    """Run one shipped hook through the production process/result bus services."""
+    import asyncio
+
+    from abx_dl.services.process_service import ProcessService as HookProcessService
+    from abx_dl.services.archive_result_service import ArchiveResultService as HookArchiveResultService
+    from abx_plugins.plugins.base.utils import _collect_required_schema_paths
+    from abxpkg import prepare_script_exec_plan
+    from archivebox.core.models import ArchiveResult
+    from archivebox.machine.models import Process
+    from archivebox.plugins.discovery import get_plugin_catalog
+    from archivebox.services.archive_result_service import ArchiveResultService
+    from archivebox.services.process_service import ProcessService as PersistedProcessService
+
+    discovered_plugin = get_plugin_catalog().get(plugin)
+    assert discovered_plugin is not None, f"missing test plugin {plugin}"
+    matching_hooks = [hook for hook in discovered_plugin.filter_hooks("Snapshot") if hook.name == hook_name or hook.path.name == hook_name]
+    assert len(matching_hooks) == 1, f"missing or ambiguous Snapshot hook {plugin}:{hook_name}"
+    hook_path = matching_hooks[0].path
+    projected_hook_name = event_hook_name or hook_name
+    hook_config = hook_path.parent / "config.json"
+    # This helper runs standalone hooks. Resolve their dependencies through the
+    # public abxpkg CLI below; creating a new ArchiveBox Binary row on every
+    # invocation makes a second run collide with the already-installed identity.
+    binary_env = resolve_abxpkg_binary_env(lib_dir, deps_from=_collect_required_schema_paths(hook_config))
+    hook_env = {
+        **binary_env,
+        "ABXPKG_LIB_DIR": str(lib_dir),
+        "SNAP_DIR": str(snapshot.output_dir),
+        "PATH": f"{Path(os.sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+        **(env or {}),
+    }
+    assert prepare_script_exec_plan(hook_path, env=hook_env), f"Could not prepare shipped hook {hook_path}"
+    output_dir = Path(snapshot.output_dir) / plugin
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bus = create_bus(name=f"test_real_{plugin}_{snapshot.id}")
+    hook_process_service = HookProcessService(bus, emit_jsonl=False, interactive_tty=False)
+    HookArchiveResultService(bus, emit_jsonl=False)
+    PersistedProcessService(bus)
+    ArchiveResultService(bus)
+
+    async def run() -> None:
+        try:
+            snapshot_event = SnapshotEvent(
+                url=snapshot.url,
+                snapshot_id=str(snapshot.id),
+                output_dir=str(snapshot.output_dir),
+            )
+            await bus.emit(snapshot_event).now()
+            process_event = bus.emit(
+                ProcessEvent(
+                    plugin_name=plugin,
+                    hook_name=projected_hook_name,
+                    hook_path=str(hook_path),
+                    hook_args=[f"--url={snapshot.url}"],
+                    env=hook_env,
+                    output_dir=str(output_dir),
+                    timeout=60,
+                    is_background=".bg." in hook_name,
+                    url=snapshot.url,
+                    process_type="hook",
+                    worker_type="hook",
+                    event_parent_id=snapshot_event.event_id,
+                ),
+            )
+            await process_event.now()
+            if cancel_when is not None:
+                assert await asyncio.to_thread(cancel_when.wait, 30)
+                tasks = list(hook_process_service._background_completion_tasks)
+                assert len(tasks) == 1
+                tasks[0].cancel()
+                outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+                assert isinstance(outcomes[0], asyncio.CancelledError), outcomes[0]
+            if ".bg." in hook_name:
+                completed_event = await bus.find(
+                    ProcessCompletedEvent,
+                    child_of=process_event,
+                    past=True,
+                    future=False if cancel_when is not None else 90,
+                )
+                assert completed_event is not None
+                await completed_event.wait(timeout=90)
+                await completed_event.event_results_list()
+            await bus.wait_until_idle()
+        finally:
+            await bus.destroy(clear=False)
+
+    asyncio.run(run())
+    process = Process.objects.filter(pwd=str(output_dir)).order_by("-created_at").first()
+    assert process is not None
+    process.refresh_from_db()
+    assert process.exit_code in expected_exit_codes, (process.stdout, process.stderr)
+    results = ArchiveResult.objects.filter(snapshot=snapshot, plugin=plugin, hook_name=projected_hook_name)
+    result = results.first() if cancel_when is not None else results.get()
+    return process, result
+
+
+def _run_real_title_crawl(url: str, lib_dir: Path):
+    import asyncio
+
+    from archivebox.base_models.models import get_or_create_system_user_pk
+    from archivebox.crawls.models import Crawl
+    from archivebox.core.models import Snapshot
+    from archivebox.services.runner import CrawlRunner, run_install
+
+    run_install(plugin_names=["title"])
+    crawl = Crawl.objects.create(
+        urls=url,
+        config={"ABXPKG_LIB_DIR": str(lib_dir), "PLUGINS": "title"},
+        created_by_id=get_or_create_system_user_pk(),
+    )
+    asyncio.run(CrawlRunner(crawl, selected_plugins=["title"], show_progress=False).run())
+    return Snapshot.objects.get(crawl=crawl, url=url)
+
+
+def _create_snapshot():
+    from archivebox.base_models.models import get_or_create_system_user_pk
+    from archivebox.crawls.models import Crawl
+    from archivebox.core.models import Snapshot
+
+    crawl = Crawl(
+        urls="https://example.com",
+        created_by_id=get_or_create_system_user_pk(),
+    )
+    crawl.save()
+
+    snapshot = Snapshot(
+        url="https://example.com",
+        crawl=crawl,
+        status=Snapshot.StatusChoices.STARTED,
+    )
+    snapshot.save()
+    return snapshot
+
+
+def test_process_completed_projects_inline_archiveresult(tmp_path, hermetic_lib_dir):
+    from archivebox.core.models import ArchiveResult
+
+    snapshot = _create_snapshot()
+    snapshot_dir = Path(snapshot.output_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (snapshot_dir / "source.txt").write_text("real hook input", encoding="utf-8")
+    process, result = _run_shipped_snapshot_hook(
+        snapshot,
+        plugin="hashes",
+        hook_name="on_Snapshot__93_hashes.py",
+        lib_dir=hermetic_lib_dir,
+    )
+
+    assert result.status == ArchiveResult.StatusChoices.SUCCEEDED
+    assert result.process_id == process.id
+    manifest = snapshot_dir / "hashes" / "hashes.json"
+    checksum = snapshot_dir / "hashes" / "hashes.sha256"
+    assert checksum.read_text() == hashlib.sha256(manifest.read_bytes()).hexdigest() + "\n"
+    assert result.output_str.endswith(json.loads(manifest.read_text())["root_hash"][:12])
+    assert result.output_files == {
+        "hashes.json": {
+            "extension": "json",
+            "mimetype": "application/json",
+            "size": manifest.stat().st_size,
+        },
+        "hashes.sha256": {"extension": "sha256", "mimetype": "", "size": 65},
+    }
+    assert result.output_size == manifest.stat().st_size + checksum.stat().st_size
+    _cleanup_machine_process_rows()
+
+
+def test_archiveresult_event_retry_updates_existing_hook_row(tmp_path, hermetic_lib_dir):
+    from archivebox.core.models import ArchiveResult
+
+    snapshot = _create_snapshot()
+    snapshot_dir = Path(snapshot.output_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (snapshot_dir / "source.txt").write_text("first input", encoding="utf-8")
+    _, first_result = _run_shipped_snapshot_hook(
+        snapshot,
+        plugin="hashes",
+        hook_name="on_Snapshot__93_hashes.py",
+        lib_dir=hermetic_lib_dir,
+        env={"HASHES_ENABLED": "False"},
+    )
+    first_result_id = first_result.id
+    assert first_result.status == ArchiveResult.StatusChoices.SKIPPED
+
+    (snapshot_dir / "source.txt").write_text("retry input", encoding="utf-8")
+    _, retry_result = _run_shipped_snapshot_hook(
+        snapshot,
+        plugin="hashes",
+        hook_name="on_Snapshot__93_hashes.py",
+        lib_dir=hermetic_lib_dir,
+        env={"HASHES_ENABLED": "True"},
+    )
+    assert retry_result.id == first_result_id
+    assert retry_result.status == ArchiveResult.StatusChoices.SUCCEEDED
+    assert ArchiveResult.objects.filter(snapshot=snapshot, plugin="hashes", hook_name="on_Snapshot__93_hashes.py").count() == 1
+    _cleanup_machine_process_rows()
+
+
+def test_archiveresult_duplicate_hook_rows_are_rejected():
+    from django.db import IntegrityError, transaction
+    from archivebox.core.models import ArchiveResult
+
+    snapshot = _create_snapshot()
+    ArchiveResult.objects.create(
+        snapshot=snapshot,
+        plugin="wget",
+        hook_name="on_Snapshot__06_wget.finite.bg",
+        status=ArchiveResult.StatusChoices.FAILED,
+    )
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        ArchiveResult.objects.create(
+            snapshot=snapshot,
+            plugin="wget",
+            hook_name="on_Snapshot__06_wget.finite.bg",
+            status=ArchiveResult.StatusChoices.SUCCEEDED,
+        )
+
+
+def test_archiveresult_event_create_uses_one_result_lookup():
+    from abx_dl.events import ArchiveResultEvent
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    from archivebox.services.archive_result_service import _save_archiveresult_event_to_db
+
+    snapshot = _create_snapshot()
+    event = ArchiveResultEvent(
+        snapshot_id=str(snapshot.id),
+        plugin="review-query-count",
+        hook_name="on_Snapshot__99_review.py",
+        status="failed",
+    )
+
+    with CaptureQueriesContext(connection) as queries:
+        _save_archiveresult_event_to_db(event, None)
+
+    result_lookups = [
+        query["sql"]
+        for query in queries
+        if query["sql"].lstrip().upper().startswith("SELECT") and 'FROM "core_archiveresult"' in query["sql"]
+    ]
+    assert len(result_lookups) == 1
+
+
+def test_failed_shipped_title_hook_projects_failure_without_overwriting_title(tmp_path, cached_abxpkg_lib_dir):
+    from archivebox.core.models import ArchiveResult
+
+    # Result linkage and the unchanged title are consequences of the same failed
+    # hook. Check them together using the shared real dependency installation.
+    snapshot = _create_snapshot()
+    process, result = _run_shipped_snapshot_hook(
+        snapshot,
+        plugin="title",
+        hook_name="on_Snapshot__54_title.js",
+        lib_dir=cached_abxpkg_lib_dir,
+        expected_exit_codes=(1,),
+    )
+    assert result.status == ArchiveResult.StatusChoices.FAILED
+    assert result.process_id == process.id
+    assert "Chrome session" in result.output_str
+    snapshot.refresh_from_db()
+    assert snapshot.title in (None, "")
+    assert snapshot.resolved_title == ""
+    _cleanup_machine_process_rows()
+
+
+def test_snapshot_resolved_title_ignores_failed_title_output_str():
+    from archivebox.core.models import ArchiveResult
+
+    snapshot = _create_snapshot()
+    ArchiveResult.objects.create(
+        snapshot=snapshot,
+        plugin="title",
+        hook_name="on_Snapshot__54_title.js",
+        status=ArchiveResult.StatusChoices.FAILED,
+        output_str="No Chrome session found (chrome plugin must run first)",
+    )
+
+    snapshot.refresh_from_db()
+    assert snapshot.title in (None, "")
+    assert snapshot.resolved_title == ""
+    _cleanup_machine_process_rows()
+
+
+def test_snapshot_title_ignores_noresults_hook_output_str(tmp_path, hermetic_lib_dir):
+    from archivebox.core.models import ArchiveResult
+
+    snapshot = _create_snapshot()
+    staticfile_dir = Path(snapshot.output_dir) / "staticfile"
+    staticfile_dir.mkdir(parents=True, exist_ok=True)
+    (staticfile_dir / "input.txt").write_text("plain text without links", encoding="utf-8")
+    _, result = _run_shipped_snapshot_hook(
+        snapshot,
+        plugin="parse_txt_urls",
+        hook_name="on_Snapshot__71_parse_txt_urls.py",
+        lib_dir=hermetic_lib_dir,
+    )
+    assert result.status == ArchiveResult.StatusChoices.NORESULTS
+    assert result.output_str == "0 URLs parsed"
+    snapshot.refresh_from_db()
+    assert snapshot.title in (None, "")
+    assert snapshot.resolved_title == ""
+    _cleanup_machine_process_rows()
+
+
+def test_snapshot_save_normalizes_url_title_to_none():
+    from archivebox.core.models import Snapshot
+
+    snapshot = _create_snapshot()
+    snapshot.title = snapshot.url
+    snapshot.save(update_fields=["title", "modified_at"])
+
+    snapshot.refresh_from_db()
+    assert snapshot.title is None
+    assert snapshot.resolved_title == ""
+
+    created = Snapshot.objects.create(
+        url="https://example.com/title-normalize-create",
+        title="https://example.com/title-normalize-create",
+        crawl=snapshot.crawl,
+    )
+
+    created.refresh_from_db()
+    assert created.title is None
+    assert created.resolved_title == ""
+    _cleanup_machine_process_rows()
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    (
+        ("Nick Sweeting: Blog & Projects", "Nick Sweeting: Blog & Projects"),
+        ("Nick Sweeting: Blog &amp; Projects", "Nick Sweeting: Blog & Projects"),
+        ("Safe &lt;script&gt;alert(1)&lt;/script&gt; title", "Safe alert(1) title"),
+    ),
+)
+def test_snapshot_title_normalization_decodes_entities_without_restoring_markup(candidate, expected):
+    from archivebox.core.models import Snapshot
+
+    assert Snapshot._normalize_title_candidate(candidate, snapshot_url="https://example.com") == expected
+
+
+def test_process_completed_projects_noresults_archiveresult(tmp_path, hermetic_lib_dir):
+    from archivebox.core.models import ArchiveResult
+
+    snapshot = _create_snapshot()
+    staticfile_dir = Path(snapshot.output_dir) / "staticfile"
+    staticfile_dir.mkdir(parents=True, exist_ok=True)
+    (staticfile_dir / "input.txt").write_text("plain text without links", encoding="utf-8")
+    process, result = _run_shipped_snapshot_hook(
+        snapshot,
+        plugin="parse_txt_urls",
+        hook_name="on_Snapshot__71_parse_txt_urls.py",
+        lib_dir=hermetic_lib_dir,
+    )
+    assert result.status == ArchiveResult.StatusChoices.NORESULTS
+    assert result.output_str == "0 URLs parsed"
+    assert result.process_id == process.id
+
+
+def test_skipped_shipped_hook_does_not_infer_success_from_snapshot_files(snapshot, hermetic_lib_dir):
+    from archivebox.core.models import ArchiveResult
+
+    snapshot_dir = Path(snapshot.output_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (snapshot_dir / "source.txt").write_text("real input remains present", encoding="utf-8")
+    _, result = _run_shipped_snapshot_hook(
+        snapshot,
+        plugin="hashes",
+        hook_name="on_Snapshot__93_hashes.py",
+        lib_dir=hermetic_lib_dir,
+        env={"HASHES_ENABLED": "False"},
+    )
+    assert result.status == ArchiveResult.StatusChoices.SKIPPED
+    assert result.output_str == "HASHES_ENABLED=False"
+    assert "hashes.json" not in result.output_files
+    assert not (snapshot_dir / "hashes" / "hashes.json").exists()
+    _cleanup_machine_process_rows()
+
+
+def test_retry_failed_archiveresults_requeues_snapshot_in_queued_state():
+    from archivebox.core.models import ArchiveResult, Snapshot
+
+    snapshot = _create_snapshot()
+    ArchiveResult.objects.create(
+        snapshot=snapshot,
+        plugin="chrome",
+        hook_name="on_Snapshot__11_chrome_wait",
+        status=ArchiveResult.StatusChoices.FAILED,
+        output_str="timed out",
+        output_files={"stderr.log": {}},
+        output_size=123,
+        output_mimetypes="text/plain",
+    )
+    ArchiveResult.objects.create(
+        snapshot=snapshot,
+        plugin="ublock",
+        hook_name="on_Snapshot__12_ublock",
+        status=ArchiveResult.StatusChoices.SKIPPED,
+        output_str="not applicable",
+    )
+    ArchiveResult.objects.create(
+        snapshot=snapshot,
+        plugin="forumdl",
+        hook_name="on_Snapshot__50_forumdl",
+        status=ArchiveResult.StatusChoices.NORESULTS,
+        output_str="0 outputs",
+    )
+
+    reset_count = snapshot.retry_failed_archiveresults()
+
+    snapshot.refresh_from_db()
+    result = ArchiveResult.objects.get(snapshot=snapshot, plugin="chrome", hook_name="on_Snapshot__11_chrome_wait")
+    assert reset_count == 1
+    assert snapshot.status == Snapshot.StatusChoices.QUEUED
+    assert snapshot.retry_at is not None
+    assert snapshot.config["RETRY_PLUGINS"] == ["chrome"]
+    assert "PLUGINS" not in snapshot.config
+    assert result.status == ArchiveResult.StatusChoices.FAILED
+    assert result.output_str == "timed out"
+    assert result.output_files == {"stderr.log": {}}
+    assert result.output_size == 123
+    assert result.output_mimetypes == "text/plain"
+    assert ArchiveResult.objects.get(snapshot=snapshot, plugin="ublock").status == ArchiveResult.StatusChoices.SKIPPED
+    assert ArchiveResult.objects.get(snapshot=snapshot, plugin="forumdl").status == ArchiveResult.StatusChoices.NORESULTS
+    snapshot.refresh_from_db()
+    assert snapshot.title in (None, "")
+    _cleanup_machine_process_rows()
+
+
+def test_process_completed_projects_snapshot_title_from_output_str(recursive_test_site, cached_abxpkg_lib_dir):
+    snapshot = _run_real_title_crawl(recursive_test_site["root_url"], cached_abxpkg_lib_dir)
+    result = snapshot.archiveresult_set.get(plugin="title")
+
+    assert result.status == result.StatusChoices.SUCCEEDED
+    assert result.output_str == "Root"
+    assert snapshot.title == "Root"
+    _cleanup_machine_process_rows()
+
+
+def test_process_completed_projects_snapshot_title_from_title_file(recursive_test_site, cached_abxpkg_lib_dir):
+    snapshot = _run_real_title_crawl(recursive_test_site["root_url"], cached_abxpkg_lib_dir)
+    title_file = Path(snapshot.output_dir) / "title" / "title.txt"
+    result = snapshot.archiveresult_set.get(plugin="title")
+
+    assert title_file.read_text() == "Root"
+    assert result.output_files["title.txt"]["size"] == title_file.stat().st_size
+    assert snapshot.resolved_title == title_file.read_text()
+    _cleanup_machine_process_rows()
+
+
+def test_snapshot_resolved_title_falls_back_to_title_file_without_db_title():
+    from archivebox.core.models import ArchiveResult
+
+    snapshot = _create_snapshot()
+    plugin_dir = Path(snapshot.output_dir) / "title"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "title.txt").write_text("Example Domain")
+    ArchiveResult.objects.create(
+        snapshot=snapshot,
+        plugin="title",
+        hook_name="on_Snapshot__54_title.js",
+        status="noresults",
+        output_str="No title found",
+        output_files={"title.txt": {}},
+    )
+
+    snapshot.refresh_from_db()
+    assert snapshot.title in (None, "")
+    assert snapshot.resolved_title == "Example Domain"
+    _cleanup_machine_process_rows()
+
+
+def test_collect_output_metadata_preserves_file_metadata():
+    from archivebox.services.archive_result_service import _resolve_output_metadata
+
+    output_files, output_size, output_mimetypes = _resolve_output_metadata(
+        [OutputFile(path="index.html", extension="html", mimetype="text/html", size=42)],
+    )
+
+    assert output_files == {
+        "index.html": {
+            "extension": "html",
+            "mimetype": "text/html",
+            "size": 42,
+        },
+    }
+    assert output_size == 42
+    assert output_mimetypes == "text/html"
+
+
+def test_collect_output_metadata_detects_warc_gz_mimetype(tmp_path):
+    from abx_dl.output_files import OutputManifest
+
+    plugin_dir = tmp_path / "wget"
+    warc_file = plugin_dir / "warc" / "capture.warc.gz"
+    warc_file.parent.mkdir(parents=True, exist_ok=True)
+    warc_file.write_bytes(b"warc-bytes")
+
+    manifest = OutputManifest.scan(plugin_dir)
+    output_files = manifest.as_mapping()
+    output_size = manifest.total_size
+    output_mimetypes = ",".join(manifest.mimetypes)
+
+    assert output_files["warc/capture.warc.gz"] == {
+        "extension": "gz",
+        "mimetype": "application/warc",
+        "size": 10,
+    }
+    assert output_size == 10
+    assert output_mimetypes == "application/warc"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_process_started_hydrates_binary_and_iface_from_existing_binary_records(
+    tmp_path,
+    hermetic_lib_dir,
+    recursive_test_site,
+):
+    from abx_plugins.plugins.base.utils import get_hydrated_required_binary
+    from archivebox.machine.models import NetworkInterface
+    from archivebox.machine.models import Process as MachineProcess
+    from archivebox.services.process_service import ProcessService as ArchiveBoxProcessService
+    from abx_dl.services.process_service import ProcessService as DlProcessService
+
+    iface = NetworkInterface.current()
+    machine = iface.machine
+
+    lib_dir = hermetic_lib_dir
+    mercury_config = Path(str(files("abx_plugins.plugins.mercury").joinpath("config.json")))
+    required_binary = get_hydrated_required_binary(
+        "mercury-parser",
+        mercury_config,
+        environ=os.environ,
+    )
+    binary = install_real_binary(
+        "mercury-parser",
+        machine=machine,
+        binproviders=required_binary["binproviders"],
+        overrides=required_binary["overrides"],
+    )
+    mercury_env = resolve_abxpkg_binary_env(
+        lib_dir,
+        deps_from=mercury_config,
+    )
+    mercury_path = Path(mercury_env["MERCURY_BINARY"])
+    provider_path = Path(binary.abspath)
+    assert binary.binprovider == "npm"
+    assert provider_path == lib_dir / "npm" / "packages" / "mercury" / "node_modules" / ".bin" / "mercury-parser"
+    assert provider_path.is_file()
+    assert os.access(provider_path, os.X_OK)
+    assert mercury_path == lib_dir / "env" / "bin" / "mercury-parser"
+    assert mercury_path.is_symlink()
+    assert mercury_path.resolve().is_file()
+    assert os.access(mercury_path, os.X_OK)
+
+    hook_path = Path(str(files("abx_plugins.plugins.mercury").joinpath("on_Snapshot__66_mercury.py")))
+    output_dir = tmp_path / "mercury"
+    output_dir.mkdir()
+
+    bus = create_bus(name="test_process_started_binary_hydration")
+    DlProcessService(bus, emit_jsonl=False, interactive_tty=False)
+    ArchiveBoxProcessService(bus)
+
+    async def run_test() -> None:
+        await bus.emit(
+            ProcessEvent(
+                plugin_name="mercury",
+                hook_name="on_Snapshot__66_mercury.py",
+                hook_path=str(hook_path),
+                hook_args=[f"--url={recursive_test_site['root_url']}"],
+                is_background=False,
+                output_dir=str(output_dir),
+                env={
+                    **mercury_env,
+                    "ABXPKG_LIB_DIR": str(lib_dir),
+                    "SNAP_DIR": str(tmp_path),
+                },
+                timeout=60,
+                url=recursive_test_site["root_url"],
+            ),
+        ).now()
+        started = await bus.find(
+            ProcessStartedEvent,
+            past=True,
+            future=False,
+            hook_name="on_Snapshot__66_mercury.py",
+            output_dir=str(output_dir),
+        )
+        assert started is not None
+        await started.wait()
+        await started.event_results_list()
+
+    import asyncio
+
+    asyncio.run(run_test())
+
+    process = MachineProcess.objects.get(
+        pwd=str(output_dir),
+        cmd=[str(hook_path), f"--url={recursive_test_site['root_url']}"],
+    )
+    assert process.binary_id == binary.id
+    assert process.iface_id == iface.id
+    assert process.exit_code == 0, process.stderr
+    assert (output_dir / "content.html").read_text() == (
+        '<body> <a href="/about">About</a> <a href="/blog">Blog</a> <a href="/contact">Contact</a> </body>'
+    )
+    assert (output_dir / "content.txt").read_text() == "About Blog Contact"
+    article = json.loads((output_dir / "article.json").read_text())
+    assert article["title"] == "Root"
+    assert article["url"] == recursive_test_site["root_url"]
+    assert article["word_count"] == 3
+
+
+@pytest.mark.django_db(transaction=True)
+def test_process_started_uses_node_binary_for_js_hooks_without_plugin_binary(tmp_path, cached_abxpkg_lib_dir):
+    from archivebox.machine.models import Binary, NetworkInterface
+    from archivebox.machine.models import Process as MachineProcess
+    from archivebox.services.process_service import ProcessService as ArchiveBoxProcessService
+    from archivebox.services.runner import run_install
+    from abx_dl.services.process_service import ProcessService as DlProcessService
+
+    lib_dir = cached_abxpkg_lib_dir
+    run_install(plugin_names=["chrome"])
+    installed_node_ids = set(
+        Binary.objects.filter(name="node", status=Binary.StatusChoices.INSTALLED).values_list("id", flat=True),
+    )
+    assert installed_node_ids
+    iface = NetworkInterface.current()
+    node_env = resolve_abxpkg_binary_env(lib_dir, "node")
+    node_path = lib_dir / "env" / "bin" / "node"
+
+    hook_path = Path(str(files("abx_plugins.plugins.chrome").joinpath("on_CrawlSetup__89_chrome_kill_zombies.js")))
+    crawl_dir = tmp_path / "crawl"
+    output_dir = crawl_dir / "chrome"
+    output_dir.mkdir(parents=True)
+
+    bus = create_bus(name="test_process_started_node_fallback")
+    DlProcessService(bus, emit_jsonl=False, interactive_tty=False)
+    ArchiveBoxProcessService(bus)
+
+    async def run_test() -> None:
+        await bus.emit(
+            ProcessEvent(
+                plugin_name="chrome",
+                hook_name="on_CrawlSetup__89_chrome_kill_zombies.js",
+                hook_path=str(hook_path),
+                hook_args=[],
+                is_background=False,
+                output_dir=str(output_dir),
+                env={
+                    **node_env,
+                    "ABXPKG_LIB_DIR": str(lib_dir),
+                    "NODE_BINARY": str(node_path),
+                    "CRAWL_DIR": str(crawl_dir),
+                    "SNAP_DIR": str(crawl_dir / "snapshot"),
+                    "CHROME_USER_DATA_DIR": str(output_dir / "profile"),
+                },
+                timeout=60,
+                url="https://example.com",
+            ),
+        ).now()
+        started = await bus.find(
+            ProcessStartedEvent,
+            past=True,
+            future=False,
+            hook_name="on_CrawlSetup__89_chrome_kill_zombies.js",
+            output_dir=str(output_dir),
+        )
+        assert started is not None
+        await started.wait()
+        await started.event_results_list()
+
+    import asyncio
+
+    asyncio.run(run_test())
+
+    process = MachineProcess.objects.get(
+        pwd=str(output_dir),
+        cmd=[str(hook_path)],
+    )
+    assert process.binary_id is not None
+    assert process.binary_id in installed_node_ids
+    assert process.binary.name == "node"
+    assert process.binary.status == process.binary.StatusChoices.INSTALLED
+    assert Path(process.binary.abspath).resolve() == node_path.resolve()
+    assert process.iface_id == iface.id
+    assert process.exit_code == 0, process.stderr
+    assert "chrome zombies. cpu usage:" in process.stdout
+
+
+def test_binary_event_updates_existing_row_from_native_abxpkg_resolution():
+    from archivebox.machine.models import Binary, Machine
+    from archivebox.services.binary_service import ArchiveBoxBinaryService
+    from abxpkg.binary_service import BinaryService
+    import asyncio
+
+    machine = Machine.current()
+    binary = install_real_binary("wget", machine=machine, binproviders="env,apt,brew")
+    native_wget = shutil.which("wget")
+    assert native_wget is not None
+    binary.abspath = "/bin/sh"
+    binary.save(update_fields=["abspath", "modified_at"])
+    stale_abspath = binary.abspath
+
+    bus = create_bus(name="test_binary_event_reuses_existing_installed_binary_row")
+    ArchiveBoxBinaryService(bus)
+    BinaryService(bus)
+    event = BinaryRequestEvent(
+        name="wget",
+        binproviders=binary.binproviders,
+        extra_context={
+            "plugin_name": "wget",
+            "output_dir": str(binary.output_dir),
+        },
+    )
+
+    async def run_event():
+        await bus.emit(event).now()
+        await bus.wait_until_idle()
+
+    asyncio.run(run_event())
+
+    binary.refresh_from_db()
+    assert Binary.objects.filter(machine=machine, name="wget").count() == 1
+    assert binary.status == Binary.StatusChoices.INSTALLED
+    assert Path(binary.abspath).resolve() == Path(native_wget).resolve()
+    assert binary.abspath != stale_abspath
+    assert binary.version
+    assert binary.binprovider == "env"
+    assert binary.binproviders == "env,apt,brew"
+
+
+def test_result_consumer_timeout_surfaces_after_real_hook_completion(tmp_path, hermetic_lib_dir):
+    """A successful hook cannot hide a result consumer lost to real SQLite contention."""
+    import asyncio
+    import sqlite3
+
+    from asgiref.sync import sync_to_async
+    from django.db import close_old_connections, connection
+
+    from abx_dl.events import ArchiveResultEvent
+    from abx_dl.services.process_service import ProcessService as HookProcessService
+    from abx_dl.services.archive_result_service import ArchiveResultService as HookResultService
+    from abx_plugins.plugins.base.utils import _collect_required_schema_paths
+    from abxpkg import prepare_script_exec_plan
+    from archivebox.core.models import ArchiveResult
+    from archivebox.machine.models import Process
+    from archivebox.plugins.discovery import get_plugin_catalog
+    from archivebox.services.process_service import ProcessService
+    from archivebox.services.archive_result_service import ArchiveResultService
+
+    snapshot = _create_snapshot()
+    snapshot_dir = Path(snapshot.output_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    source = snapshot_dir / "source.txt"
+    source.write_text("Actual native hash input.\n" * 10000)
+    hook = get_plugin_catalog()["hashes"].filter_hooks("Snapshot")[0]
+    binary_env = resolve_abxpkg_binary_env(hermetic_lib_dir, deps_from=_collect_required_schema_paths(hook.path.parent / "config.json"))
+    assert prepare_script_exec_plan(hook.path, env=binary_env)
+    output_dir = snapshot_dir / "hashes"
+    output_dir.mkdir()
+    db_path = connection.settings_dict["NAME"]
+    assert Path(db_path).is_file(), "The contention regression requires the existing file-backed test DB"
+
+    async def run():
+        bus = create_bus(name="test_result_consumer_sqlite_contention")
+        HookProcessService(bus, emit_jsonl=False, interactive_tty=False)
+        HookResultService(bus, emit_jsonl=False)
+        ProcessService(bus)
+        ArchiveResultService(bus)
+        writer = await asyncio.to_thread(sqlite3.connect, db_path, check_same_thread=False)
+        try:
+            snapshot_event = SnapshotEvent(url=snapshot.url, snapshot_id=str(snapshot.id), output_dir=str(snapshot_dir))
+            await bus.emit(snapshot_event).now()
+            process_event = bus.emit(
+                ProcessEvent(
+                    plugin_name="hashes",
+                    hook_name=hook.name,
+                    hook_path=str(hook.path),
+                    hook_args=[f"--url={snapshot.url}"],
+                    env={
+                        **binary_env,
+                        "ABXPKG_LIB_DIR": str(hermetic_lib_dir),
+                        "SNAP_DIR": str(snapshot_dir),
+                        "PATH": f"{Path(os.sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+                    },
+                    output_dir=str(output_dir),
+                    timeout=60,
+                    is_background=False,
+                    url=snapshot.url,
+                    process_type="hook",
+                    worker_type="hook",
+                    event_parent_id=snapshot_event.event_id,
+                ),
+            )
+            task = asyncio.create_task(process_event.now())
+            started = await bus.find(ProcessStartedEvent, child_of=process_event, past=True, future=60)
+            assert started is not None
+            await started.wait()
+            await started.event_results_list()
+            # Hold a real independent writer only after the actual running row exists.
+            # No handler, process, event deadline, or SQLite timeout is substituted.
+            await asyncio.to_thread(writer.execute, "BEGIN IMMEDIATE")
+            try:
+                result_event = await bus.find(ArchiveResultEvent, child_of=started, past=True, future=60)
+                assert result_event is not None
+                await result_event.now()
+                # The timed-out async caller can leave its synchronous DB work running.
+                # Queue normal connection cleanup behind that work before releasing the
+                # writer, so the real backend reaches its existing bounded lock abort.
+                await sync_to_async(close_old_connections, thread_sensitive=True)()
+            finally:
+                await asyncio.to_thread(writer.rollback)
+            await task
+            await bus.wait_until_idle()
+            completed = await bus.find(ProcessCompletedEvent, child_of=started, past=True, future=False)
+            assert completed is not None and completed.exit_code == 0 and not completed.cancelled
+            with pytest.raises(RuntimeError, match="ArchiveResult consumers did not complete"):
+                await process_event.event_results_list()
+        finally:
+            await asyncio.to_thread(writer.rollback)
+            await asyncio.to_thread(writer.close)
+            await bus.destroy(clear=False)
+
+    asyncio.run(run())
+    process = Process.objects.filter(pwd=str(output_dir)).latest("created_at")
+    result = ArchiveResult.objects.get(snapshot=snapshot, plugin="hashes", hook_name=hook.name)
+    assert process.exit_code == 0
+    assert result.status == ArchiveResult.StatusChoices.STARTED
+    assert result.output_size == 0
+    hashes = json.loads((output_dir / "hashes.json").read_text())
+    assert any(item["path"] == "source.txt" and item["hash"] == hashlib.sha256(source.read_bytes()).hexdigest() for item in hashes["files"])
+    records = [json.loads(line) for line in (snapshot_dir / "index.jsonl").read_text().splitlines() if line.strip()]
+    assert any(record.get("type") == "ArchiveResult" and record["status"] == "succeeded" for record in records)
+    assert any(record.get("type") == "Process" and record["exit_code"] == 0 for record in records)
+    _cleanup_machine_process_rows()

@@ -1,0 +1,346 @@
+"""Slow HTTP readers must not turn archived files into server-sized buffers."""
+
+import hashlib
+import asyncio
+import io
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import psutil
+import pytest
+import requests
+
+from archivebox.core.models import Snapshot
+from archivebox.core.routes_util import get_snapshot_host
+from archivebox.crawls.models import Crawl
+from archivebox.tests.conftest import wait_for_log
+from archivebox.tests.test_orm_helpers import use_archivebox_db
+
+
+def test_async_file_stream_close_does_not_block_event_loop_during_pending_read(tmp_path):
+    from archivebox.misc.serve_static import _stream_ranged_file_async
+
+    read_fd, write_fd = os.pipe()
+    # A real buffered pipe exercises the helper's iterable/close protocol while
+    # the kernel blocks next(); the timer bounds the regression on old code.
+    source = io.BufferedReader(os.fdopen(read_fd, "rb", buffering=0))
+    iterator = _stream_ranged_file_async(source)
+    release = threading.Event()
+    release_at = []
+    timer_started = False
+
+    def release_read():
+        release_at.append(time.monotonic())
+        os.write(write_fd, b"second\n")
+        os.close(write_fd)
+        release.set()
+
+    timer = threading.Timer(2, release_read)
+    cached_file = tmp_path / "cached.txt"
+    cached_file.write_bytes(b"cached file remains readable during a remote stall")
+
+    async def check_cancellation():
+        nonlocal timer_started
+        # One stalled read must occupy only one worker. If cancellation queues
+        # close() behind BufferedReader's lock in the other worker, even a cached
+        # file cannot be served until the remote read finishes. Two workers are
+        # the smallest real executor that exposes this capacity loss.
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+        os.write(write_fd, b"first\n")
+        assert await anext(iterator) == b"first\n"
+        pending_read = asyncio.create_task(anext(iterator))
+        # Let the real executor thread enter BufferedReader's blocking pipe read.
+        await asyncio.sleep(0.1)
+        timer.start()
+        timer_started = True
+
+        heartbeat_at = []
+
+        async def heartbeat():
+            await asyncio.sleep(0.1)
+            heartbeat_at.append(time.monotonic())
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        cached_read_at = []
+
+        async def read_cached_file():
+            await asyncio.sleep(0.1)
+            payload = await asyncio.to_thread(cached_file.read_bytes)
+            cached_read_at.append(time.monotonic())
+            return payload
+
+        cached_read = asyncio.create_task(read_cached_file())
+        pending_read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending_read
+        await heartbeat_task
+        assert await cached_read == cached_file.read_bytes()
+        assert heartbeat_at[0] < release_at[0]
+        assert cached_read_at[0] < release_at[0]
+        assert source.closed
+
+    try:
+        asyncio.run(check_cancellation())
+    finally:
+        if timer_started:
+            timer.join(timeout=3)
+        if not source.closed:
+            source.close()
+        if not release.is_set():
+            os.close(write_fd)
+
+
+def test_server_accepts_authenticated_chunked_output_upload(archivebox_daemon_server):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
+    from archivebox.tests.conftest import api_auth_headers, create_admin_and_token, live_api_request
+
+    server = archivebox_daemon_server(SEARCH_BACKEND_ENGINE="sqlite", BASE_URL="http://archivebox.localhost")
+    token = create_admin_and_token(server.data_dir)
+    snapshot = live_api_request(
+        server.port,
+        "post",
+        "/api/v1/core/snapshots",
+        api_token=token,
+        json={"url": "https://example.com/chunked", "status": "sealed"},
+    )
+    assert snapshot.status_code == 200
+    payload = b"<html>Real streamed upload</html>"
+    body = encode_multipart(
+        BOUNDARY,
+        {
+            "files": SimpleUploadedFile("output.html", payload, content_type="text/html"),
+            "output_paths": "output.html",
+            "status": "succeeded",
+            "snapshot_id": snapshot.json()["id"],
+            "plugin": "dom",
+        },
+    )
+    response = requests.post(
+        f"http://127.0.0.1:{server.port}/api/v1/core/archiveresults",
+        data=iter([body[:100], body[100:]]),
+        headers={**api_auth_headers(token, port=server.port), "Content-Type": MULTIPART_CONTENT},
+        timeout=15,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "succeeded"
+    files = list((server.data_dir / "archive").glob("users/*/snapshots/*/*/*/dom/output.html"))
+    assert len(files) == 1
+    assert files[0].read_bytes() == payload
+
+
+def test_server_does_not_expand_proxy_trust(archivebox_daemon_server):
+    from archivebox.tests.conftest import create_admin_and_token
+
+    server = archivebox_daemon_server(
+        SEARCH_BACKEND_ENGINE="sqlite",
+        BASE_URL="http://localhost",
+        SERVER_SECURITY_MODE="safe-onedomain-nojsreplay",
+        REVERSE_PROXY_WHITELIST="192.0.2.0/24",
+        REVERSE_PROXY_USER_HEADER="Remote-User",
+    )
+    create_admin_and_token(server.data_dir)
+    response = requests.get(
+        f"http://127.0.0.1:{server.port}/admin/",
+        headers={"Host": "localhost", "Remote-User": "apitestadmin", "X-Forwarded-For": "192.0.2.10"},
+        allow_redirects=False,
+        timeout=15,
+    )
+    assert response.status_code == 302
+    assert "/admin/login/" in response.headers["Location"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_server_rejects_oversized_websocket_message(agent_server, live_opencode):
+    from abx_plugins.plugins.opencode import runtime
+    from abx_plugins.plugins.opencode.archivebox.conftest import _login_cookie
+    from websockets.asyncio.client import connect
+    from websockets.exceptions import ConnectionClosedError
+
+    server_url, _, _ = agent_server
+    cookie = _login_cookie(server_url)
+    created = requests.post(
+        server_url + "/admin/agent/opencode/pty",
+        headers={"Cookie": cookie, "Origin": server_url},
+        json={"command": "/bin/sh", "args": []},
+        timeout=10,
+    )
+    assert created.status_code == 200
+    pty_id = created.json()["id"]
+
+    async def check_socket():
+        async with (
+            connect(
+                server_url.replace("http", "ws", 1) + f"/admin/agent/opencode/pty/{pty_id}/connect",
+                origin=server_url,
+                additional_headers={"Cookie": cookie},
+                proxy=None,
+            ) as socket,
+            asyncio.timeout(10),
+        ):
+            await socket.send("printf 'ABX_%s\\n' BOUND_OK\n")
+            output = ""
+            while "ABX_BOUND_OK" not in output:
+                chunk = await socket.recv()
+                output += chunk.decode() if isinstance(chunk, bytes) else chunk
+            await socket.send("x" * (1024 * 1024 + 1))
+            with pytest.raises(ConnectionClosedError) as error:
+                while True:
+                    await socket.recv()
+            assert error.value.rcvd.code == 1009
+
+    try:
+        asyncio.run(check_socket())
+        assert requests.get(server_url + "/health/", timeout=10).content == b"OK"
+    finally:
+        deleted = requests.delete(
+            live_opencode.settings["origin"] + f"/pty/{pty_id}",
+            auth=runtime._server_auth(live_opencode.settings),
+            timeout=10,
+        )
+        assert deleted.status_code == 200
+
+
+def test_uvicorn_access_log_preserves_query_redaction(archivebox_daemon_server):
+    server = archivebox_daemon_server(SEARCH_BACKEND_ENGINE="sqlite", BASE_URL="http://archivebox.localhost")
+    server.wait_for_workers(("worker_uvicorn",))
+    response = requests.get(
+        f"http://127.0.0.1:{server.port}/api/v1/docs?token=transport-log-secret&limit=1",
+        headers={"Host": "api.archivebox.localhost"},
+        timeout=15,
+    )
+    assert response.status_code == 200
+    # Supervisord drains worker stdout asynchronously: receiving HTTP 200 does
+    # not mean its separate log writer has published the access record yet.
+    output = wait_for_log(server.data_dir / "logs" / "worker_uvicorn.log", "/api/v1/docs?", timeout=15)
+    assert "transport-log-secret" not in output
+    assert "/api/v1/docs?token=[REDACTED]&limit=1" in output
+
+
+@pytest.mark.django_db(transaction=True)
+def test_slow_archive_download_has_bounded_memory_and_releases_file(archivebox_daemon_server):
+    server = archivebox_daemon_server(SEARCH_BACKEND_ENGINE="sqlite", BASE_URL="http://archivebox.localhost")
+    state = server.wait_for_workers(("worker_uvicorn",))
+    process = psutil.Process(state["worker_uvicorn"]["pid"])
+    with use_archivebox_db(server.data_dir):
+        crawl = Crawl.objects.create(urls="https://example.com/download", status="sealed", retry_at=None)
+        snapshot = Snapshot.objects.create(
+            crawl=crawl,
+            url="https://example.com/download",
+            status="sealed",
+            retry_at=None,
+            config={"PERMISSIONS": "public"},
+        )
+        snapshot_id = str(snapshot.id)
+        payload = snapshot.output_dir / "staticfile" / "payload.bin"
+    payload.parent.mkdir(parents=True)
+    digest = hashlib.sha256()
+    with payload.open("wb") as output:
+        for _ in range(64):
+            chunk = os.urandom(1024 * 1024)
+            output.write(chunk)
+            digest.update(chunk)
+    host = get_snapshot_host(snapshot_id, overrides={"BASE_URL": "http://archivebox.localhost"})
+    url = f"http://127.0.0.1:{server.port}/staticfile/payload.bin?raw=1"
+    with requests.Session() as client:
+        client.trust_env = False
+        warm = client.get(url, headers={"Host": host, "Range": "bytes=0-65535"}, timeout=15)
+        assert warm.status_code == 206
+        with payload.open("rb") as source:
+            assert warm.content == source.read(65536)
+        for _ in range(2):
+            baseline = process.memory_info().rss
+            with client.get(url, headers={"Host": host}, stream=True, timeout=15) as response:
+                assert response.status_code == 200
+                assert int(response.headers["Content-Length"]) == payload.stat().st_size
+                # Hold a real TCP reader still. A transport with backpressure
+                # leaves the file open instead of eagerly buffering all bytes.
+                # After warming the route, 16 MiB allows fixed overhead but
+                # rejects buffering even one quarter of this 64 MiB payload.
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    assert process.memory_info().rss - baseline < 16 * 1024 * 1024
+                    time.sleep(0.05)
+                assert str(payload) in {entry.path for entry in process.open_files()}
+                health = client.get(f"http://127.0.0.1:{server.port}/health/", timeout=5)
+                assert health.status_code == 200
+                assert health.content == b"OK"
+            deadline = time.monotonic() + 5
+            while str(payload) in {entry.path for entry in process.open_files()}:
+                assert time.monotonic() < deadline, "Disconnected reader retained the source file"
+                time.sleep(0.05)
+        actual = hashlib.sha256()
+        with client.get(url, headers={"Host": host}, stream=True, timeout=15) as response:
+            assert response.status_code == 200
+            for chunk in response.iter_content(64 * 1024):
+                actual.update(chunk)
+        assert actual.digest() == digest.digest()
+        tail = client.get(url, headers={"Host": host, "Range": "bytes=-65536"}, timeout=15)
+        assert tail.status_code == 206
+        with payload.open("rb") as source:
+            source.seek(-65536, 2)
+            assert tail.content == source.read()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_slow_crawl_file_download_has_bounded_memory_and_releases_file(archivebox_daemon_server):
+    server = archivebox_daemon_server(SEARCH_BACKEND_ENGINE="sqlite", BASE_URL="http://archivebox.localhost")
+    state = server.wait_for_workers(("worker_uvicorn",))
+    process = psutil.Process(state["worker_uvicorn"]["pid"])
+    with use_archivebox_db(server.data_dir):
+        crawl = Crawl.objects.create(
+            urls="https://example.com/crawl-download",
+            status="sealed",
+            retry_at=None,
+            config={"PERMISSIONS": "public"},
+        )
+        crawl_id = str(crawl.id)
+        payload = crawl.output_dir / "payload.bin"
+        warm_file = crawl.output_dir / "warm.txt"
+    payload.parent.mkdir(parents=True)
+    digest = hashlib.sha256()
+    with warm_file.open("wb") as output:
+        output.write(b"warm")
+    with payload.open("wb") as output:
+        for _ in range(64):
+            chunk = os.urandom(1024 * 1024)
+            output.write(chunk)
+            digest.update(chunk)
+    url = f"http://127.0.0.1:{server.port}/api/v1/crawls/crawl/{crawl_id}/files/"
+    headers = {"Host": f"api.archivebox.localhost:{server.port}"}
+    with requests.Session() as client:
+        client.trust_env = False
+        warm = client.get(url + "warm.txt", headers=headers, timeout=15)
+        assert warm.status_code == 200
+        assert warm.content == b"warm"
+        for _ in range(2):
+            baseline = process.memory_info().rss
+            with client.get(url + "payload.bin", headers=headers, stream=True, timeout=15) as response:
+                assert response.status_code == 200
+                assert int(response.headers["Content-Length"]) == payload.stat().st_size
+                assert response.headers["Content-Type"] == "application/octet-stream"
+                assert response.headers["Content-Disposition"] == 'inline; filename="payload.bin"'
+                assert response.headers["Cache-Control"] == "no-store, no-cache, max-age=0, must-revalidate"
+                assert response.headers["Pragma"] == "no-cache"
+                assert response.headers["Expires"] == "0"
+                assert response.headers["X-Content-Type-Options"] == "nosniff"
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    assert process.memory_info().rss - baseline < 16 * 1024 * 1024
+                    time.sleep(0.05)
+                assert str(payload) in {entry.path for entry in process.open_files()}
+                health = client.get(f"http://127.0.0.1:{server.port}/health/", timeout=5)
+                assert health.status_code == 200
+                assert health.content == b"OK"
+            deadline = time.monotonic() + 5
+            while str(payload) in {entry.path for entry in process.open_files()}:
+                assert time.monotonic() < deadline, "Disconnected reader retained the source file"
+                time.sleep(0.05)
+        actual = hashlib.sha256()
+        with client.get(url + "payload.bin", headers=headers, stream=True, timeout=15) as response:
+            assert response.status_code == 200
+            for chunk in response.iter_content(64 * 1024):
+                actual.update(chunk)
+        assert actual.digest() == digest.digest()

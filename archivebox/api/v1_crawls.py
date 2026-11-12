@@ -1,0 +1,316 @@
+__package__ = "archivebox.api"
+
+import os
+from pathlib import Path
+from hashlib import sha256
+from uuid import UUID
+from datetime import datetime
+from django.http import FileResponse, HttpRequest
+from django.shortcuts import redirect
+from django.utils import timezone
+
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import User
+
+from ninja import Router, Schema
+from ninja.errors import HttpError
+
+from archivebox.core.models import Snapshot
+from archivebox.core.permissions import (
+    PERMISSIONS_PUBLIC,
+    PERMISSIONS_UNLISTED,
+    is_admin_user,
+    normalize_permissions,
+)
+from archivebox.config.common import get_config
+from archivebox.crawls.models import Crawl
+from archivebox.misc.serve_static import RangedFileReader, _is_asgi_request, _stream_ranged_file_async
+from archivebox.misc.util import filter_queryset_by_uuid_substring, validate_url
+
+from .auth import API_AUTH_METHODS, authenticated_user_from_request
+
+router = Router(tags=["Crawl Models"], auth=API_AUTH_METHODS)
+
+
+class CrawlSchema(Schema):
+    TYPE: str = "crawls.models.Crawl"
+
+    id: UUID
+
+    modified_at: datetime
+    created_at: datetime
+    created_by_id: str
+    created_by_username: str
+
+    status: str
+    retry_at: datetime | None
+    is_paused: bool
+
+    urls: str
+    max_depth: int
+    tags_str: str
+    config: dict
+
+    @staticmethod
+    def resolve_created_by_id(obj):
+        return str(obj.created_by_id)
+
+    @staticmethod
+    def resolve_created_by_username(obj):
+        user_model = get_user_model()
+        user = user_model.objects.get(id=obj.created_by_id)
+        username = user.username
+        return username if isinstance(username, str) else str(user)
+
+    @staticmethod
+    def resolve_config(obj):
+        # Redact credential values so REST responses can never leak the raw
+        # token/secret/api-key that the operator stored in Crawl.config.
+        from archivebox.config.common import redact_sensitive_config
+
+        return redact_sensitive_config(obj.config)
+
+    @staticmethod
+    def resolve_snapshots(obj, context):
+        if bool(context["request"].__dict__.get("with_snapshots", False)):
+            return obj.snapshot_set.all().distinct()
+        return Snapshot.objects.none()
+
+
+class CrawlUpdateSchema(Schema):
+    action: str | None = None
+    status: str | None = None
+    retry_at: datetime | None = None
+    tags: list[str] | None = None
+    tags_str: str | None = None
+
+
+class CrawlCreateSchema(Schema):
+    urls: list[str]
+    max_depth: int = 0
+    tags: list[str] | None = None
+    tags_str: str = ""
+    label: str = ""
+    notes: str = ""
+    config: dict = {}
+
+
+class CrawlDeleteResponseSchema(Schema):
+    success: bool
+    crawl_id: str
+    deleted_count: int
+    deleted_snapshots: int
+
+
+def normalize_tag_list(tags: list[str] | None = None, tags_str: str = "") -> list[str]:
+    if tags is not None:
+        return [tag.strip() for tag in tags if tag and tag.strip()]
+    return [tag.strip() for tag in tags_str.split(",") if tag.strip()]
+
+
+@router.get("/crawls", response=list[CrawlSchema], url_name="get_crawls")
+def get_crawls(request: HttpRequest):
+    return Crawl.objects.all().distinct()
+
+
+@router.post("/crawls", response=CrawlSchema, url_name="create_crawl")
+def create_crawl(request: HttpRequest, data: CrawlCreateSchema):
+    try:
+        urls = [validate_url(url) for url in data.urls if url and url.strip()]
+    except ValueError as err:
+        raise HttpError(400, str(err)) from err
+    if not urls:
+        raise HttpError(400, "At least one URL is required")
+    if data.max_depth not in (0, 1, 2, 3, 4):
+        raise HttpError(400, "max_depth must be between 0 and 4")
+
+    tags = normalize_tag_list(data.tags, data.tags_str)
+    config = dict(data.config or {})
+    config.setdefault("PARSER", "url_list")
+    config.setdefault("PERMISSIONS", str(get_config().PERMISSIONS))
+    crawl = Crawl.objects.create(
+        urls="\n".join(urls),
+        max_depth=data.max_depth,
+        tags_str=",".join(tags),
+        label=data.label,
+        notes=data.notes,
+        config=config,
+        status=Crawl.StatusChoices.QUEUED,
+        retry_at=timezone.now(),
+        created_by=request.user if isinstance(request.user, User) else None,
+    )
+    return crawl
+
+
+def get_crawl_by_ref(crawl_id: str):
+    return filter_queryset_by_uuid_substring(Crawl.objects.all(), crawl_id).get()
+
+
+@router.get("/crawl/{crawl_id}", response=CrawlSchema, url_name="get_crawl")
+def get_crawl(request: HttpRequest, crawl_id: str, as_rss: bool = False, with_snapshots: bool = False, with_archiveresults: bool = False):
+    """Get a specific Crawl by id."""
+    setattr(request, "with_snapshots", with_snapshots)
+    setattr(request, "with_archiveresults", with_archiveresults)
+    crawl = get_crawl_by_ref(crawl_id)
+
+    if crawl and as_rss:
+        query = request.GET.copy()
+        query.pop("as_rss", None)
+        query["crawl_id"] = str(crawl.id)
+        return redirect(f"/api/v1/core/snapshots.rss?{query.urlencode()}")
+
+    return crawl
+
+
+def crawl_file(request: HttpRequest, crawl_id: str, path: str):
+    # Try to resolve the crawl first; if it doesn't exist, return 404.
+    try:
+        crawl = get_crawl_by_ref(crawl_id)
+    except Crawl.DoesNotExist:
+        raise HttpError(404, "Crawl not found")
+
+    user = authenticated_user_from_request(request)
+
+    # Gate access using the same model as SnapshotView/can_view_snapshot:
+    # admins always pass; owners can see their own crawls; otherwise the crawl
+    # must be PUBLIC or UNLISTED. Don't disclose existence of private crawls.
+    if not is_admin_user(request):
+        permissions = normalize_permissions(crawl.permissions)
+        is_owner = bool(user and crawl.created_by_id == user.id)
+        # UUIDv7 prefixes are guessable timestamps: not an unlisted link (suffixes are random).
+        ref, full_id = crawl_id.replace("-", "").lower(), str(crawl.id).replace("-", "")
+        by_prefix = ref != full_id and full_id.startswith(ref)
+        if not is_owner and not (permissions == PERMISSIONS_PUBLIC or (permissions == PERMISSIONS_UNLISTED and not by_prefix)):
+            raise HttpError(404, "Crawl not found")
+
+    # WHY: .persona holds the crawl's browser logins (cookies.txt, auth.json,
+    # chrome_profile). Older crawls kept it as a real directory inside the crawl
+    # output, so the resolve() containment check below cannot exclude it. Match
+    # serve_static's snapshot rule; casefold covers case-insensitive filesystems.
+    if any(part.casefold() == ".persona" for part in Path(path).parts):
+        raise HttpError(404, "Crawl file not found")
+
+    started_at = None
+    if path == "chrome_screencast/latest.jpg" and request.GET.get("after"):
+        try:
+            started_at = float(request.GET["after"])
+        except ValueError:
+            raise HttpError(400, "Invalid screencast start time")
+
+    file = None
+    if path == "chrome_screencast/latest.jpg":
+        # Polled every second while a capture runs: open the local TMP_DIR frame
+        # directly. The hook keys it by path.resolve(CRAWL_DIR), which is lexical
+        # like abspath; try the current then legacy hyphenated crawl dir name
+        # instead of probing (possibly remote) archive storage for which exists.
+        live_root = Path(get_config(crawl=crawl, resolve_plugins=False).TMP_DIR) / "chrome_screencast"
+        for crawl_dir in crawl.output_dir_candidates:
+            try:
+                file = open(live_root / sha256(os.path.abspath(crawl_dir).encode()).hexdigest() / "latest.jpg", "rb")
+                break
+            except FileNotFoundError:
+                continue
+    if file is None:
+        crawl_root = Path(crawl.output_dir).resolve()
+        file_path = (crawl_root / path).resolve()
+        if crawl_root not in file_path.parents:
+            raise HttpError(404, "Crawl file not found")
+        try:
+            file = file_path.open("rb")
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            raise HttpError(404, "Crawl file not found")
+
+    if started_at is not None and os.fstat(file.fileno()).st_mtime < started_at:
+        file.close()
+        raise HttpError(404, "No frame for this capture yet")
+
+    response = FileResponse(file)
+    # WHY: Django materializes synchronous FileResponse iterators under ASGI.
+    # Reuse the static-file adapter so large crawl outputs remain backpressured.
+    if _is_asgi_request(request):
+        response.streaming_content = _stream_ranged_file_async(RangedFileReader(file))
+    response["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
+    response["Pragma"] = "no-cache"
+    response["Expires"] = "0"
+    response["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@router.get("/crawl/{crawl_id}/files/{filename}", auth=None, url_name="crawl_file_root")
+def crawl_file_root(request: HttpRequest, crawl_id: str, filename: str):
+    return crawl_file(request, crawl_id, filename)
+
+
+@router.get("/crawl/{crawl_id}/files/{folder}/{filename}", auth=None, url_name="crawl_file_nested_1")
+def crawl_file_nested_1(request: HttpRequest, crawl_id: str, folder: str, filename: str):
+    return crawl_file(request, crawl_id, f"{folder}/{filename}")
+
+
+@router.get("/crawl/{crawl_id}/files/{folder}/{subfolder}/{filename}", auth=None, url_name="crawl_file_nested_2")
+def crawl_file_nested_2(request: HttpRequest, crawl_id: str, folder: str, subfolder: str, filename: str):
+    return crawl_file(request, crawl_id, f"{folder}/{subfolder}/{filename}")
+
+
+@router.patch("/crawl/{crawl_id}", response=CrawlSchema, url_name="patch_crawl")
+def patch_crawl(request: HttpRequest, crawl_id: str, data: CrawlUpdateSchema):
+    """Update a crawl (e.g., set status=sealed to cancel queued work)."""
+    crawl = get_crawl_by_ref(crawl_id)
+    payload = data.dict(exclude_unset=True)
+    update_fields = ["modified_at"]
+
+    action = payload.pop("action", None)
+    if action:
+        if action == "pause":
+            crawl.pause()
+            return crawl
+        if action in ("resume", "unpause"):
+            crawl.resume()
+            return crawl
+        if action == "cancel":
+            crawl.cancel()
+            return crawl
+        raise HttpError(400, f"Invalid action: {action}")
+
+    tags = payload.pop("tags", None)
+    tags_str = payload.pop("tags_str", None)
+    if tags is not None or tags_str is not None:
+        crawl.tags_str = ",".join(normalize_tag_list(tags, tags_str or ""))
+        update_fields.append("tags_str")
+
+    if "status" in payload:
+        if payload["status"] not in Crawl.StatusChoices.values:
+            raise HttpError(400, f"Invalid status: {payload['status']}")
+        if payload["status"] == Crawl.StatusChoices.SEALED:
+            crawl.cancel()
+            return crawl
+        crawl.status = payload["status"]
+        update_fields.append("status")
+
+    if "retry_at" in payload:
+        crawl.retry_at = payload["retry_at"]
+        update_fields.append("retry_at")
+
+    crawl.save(update_fields=update_fields)
+    return crawl
+
+
+@router.delete("/crawl/{crawl_id}", response=CrawlDeleteResponseSchema, url_name="delete_crawl")
+def delete_crawl(request: HttpRequest, crawl_id: str):
+    crawl = get_crawl_by_ref(crawl_id)
+    crawl_id_str = str(crawl.id)
+    crawl.cancel()
+
+    from archivebox.crawls.locks import crawl_lifecycle_lock
+    from archivebox.services.runner import run_pending_crawls
+
+    with crawl_lifecycle_lock(crawl_id_str):
+        run_pending_crawls(crawl_id=crawl_id_str, daemon=False)
+        crawl = get_crawl_by_ref(crawl_id_str)
+        snapshot_count = crawl.snapshot_set.count()
+        deleted_count, _ = crawl.delete()
+    return {
+        "success": True,
+        "crawl_id": crawl_id_str,
+        "deleted_count": deleted_count,
+        "deleted_snapshots": snapshot_count,
+    }

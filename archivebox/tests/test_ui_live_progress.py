@@ -1,0 +1,2134 @@
+"""Live progress UI tests."""
+
+import json
+import os
+import re
+import subprocess
+import time
+import uuid
+from datetime import datetime, timezone as dt_timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
+from pathlib import Path
+from threading import Event, Thread
+from types import SimpleNamespace
+
+import pytest
+from django.test import override_settings
+from django.urls import reverse
+from django.utils import timezone
+
+from archivebox.tests.conftest import ADMIN_TEST_HOST
+from archivebox.tests.conftest import REPO_ROOT, cli_env, resolve_abxpkg_binary_env, resolve_abxpkg_chrome_env, run_archivebox_cmd
+from archivebox.tests.test_archive_result_service import _run_shipped_snapshot_hook
+
+pytestmark = pytest.mark.django_db(transaction=True)
+
+
+@pytest.fixture
+def live_screenshot_command(snapshot, live_server, cached_abxpkg_lib_dir, tmp_path):
+    from urllib.parse import urlsplit
+
+    from archivebox.machine.models import Machine
+
+    port = urlsplit(live_server.url).port
+    machine = Machine.current()
+    machine.config = {**machine.config, "BASE_URL": f"http://archivebox.localhost:{port}"}
+    machine.save(update_fields=["config"])
+    snapshot.url = "https://sweeting.me"
+    snapshot.permissions = "public"
+    snapshot.save(update_fields=["url", "permissions"])
+    Path(snapshot.output_dir).mkdir(parents=True, exist_ok=True)
+    binary_env = resolve_abxpkg_chrome_env(cached_abxpkg_lib_dir)
+    variants = [
+        {"path": str(tmp_path / f"{name}.png"), "width": width, "height": height}
+        for name, width, height in [("desktop", 1600, 1000), ("tablet", 1024, 1366), ("mobile", 390, 844)]
+    ]
+    env = {
+        **os.environ,
+        **binary_env,
+        "NODE_PATH": str(cached_abxpkg_lib_dir / "pnpm/packages/chrome/node_modules"),
+        "SCREENSHOT_HOST_RESOLVER_RULES": "MAP *.archivebox.localhost 127.0.0.1",
+        "SCREENSHOT_REQUIRE_LIVE_PROGRESS": "1",
+        "SCREENSHOT_VARIANTS_JSON": json.dumps(variants),
+    }
+    command = [
+        binary_env["NODE_BINARY"],
+        str(REPO_ROOT / "bin/take_screenshot.js"),
+        f"http://web.archivebox.localhost:{port}{snapshot.get_absolute_url()}",
+        variants[0]["path"],
+    ]
+    return command, env, variants
+
+
+@pytest.fixture
+def painted_http_server():
+    """Serve a complete static page so CDP stops emitting changed frames."""
+
+    request_started = Event()
+
+    class PaintedBlockingHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"""<!doctype html>
+                <html><head><title>Still frame</title></head>
+                <body style="background:#246;color:white"><h1>Visible page</h1></body></html>
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            request_started.set()
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), PaintedBlockingHandler)
+    thread = Thread(target=server.serve_forever, name="archivebox-test-painted-http-barrier")
+    thread.start()
+    yield SimpleNamespace(
+        url=f"http://127.0.0.1:{server.server_port}/",
+        request_started=request_started,
+    )
+    server.shutdown()
+    server.server_close()
+    thread.join()
+
+
+@pytest.fixture
+def real_unscoped_hook_process(tmp_path):
+    from archivebox.tests.conftest import run_test_hook
+
+    snap_dir = tmp_path / "snapshot"
+    output_dir = snap_dir / "hashes"
+    output_dir.mkdir(parents=True)
+    (snap_dir / "source.txt").write_text("real live progress input", encoding="utf-8")
+    hook_path = Path(str(files("abx_plugins.plugins.hashes").joinpath("on_Snapshot__93_hashes.py")))
+    process = run_test_hook(
+        hook_path,
+        output_dir,
+        config={"ABXPKG_LIB_DIR": str(tmp_path / "lib"), "SNAP_DIR": str(snap_dir)},
+        timeout=30,
+        url="https://example.com/live-progress",
+    )
+    process.refresh_from_db()
+    assert process.exit_code == 0, process.stderr
+    return process
+
+
+@pytest.fixture
+def real_snapshot_hook_projection(snapshot, cached_abxpkg_lib_dir):
+    snap_dir = Path(snapshot.output_dir)
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    (snap_dir / "source.txt").write_text("real projected hook input", encoding="utf-8")
+    return _run_shipped_snapshot_hook(
+        snapshot,
+        plugin="hashes",
+        hook_name="on_Snapshot__93_hashes.py",
+        lib_dir=cached_abxpkg_lib_dir,
+    )
+
+
+@pytest.fixture
+def real_second_snapshot_hook_process(snapshot, tmp_path):
+    from archivebox.tests.conftest import run_test_hook
+
+    snap_dir = Path(snapshot.output_dir)
+    staticfile_dir = snap_dir / "staticfile"
+    output_dir = snap_dir / "parse_txt_urls"
+    staticfile_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (staticfile_dir / "input.txt").write_text("plain text without links", encoding="utf-8")
+    hook_path = Path(str(files("abx_plugins.plugins.parse_txt_urls").joinpath("on_Snapshot__71_parse_txt_urls.py")))
+    process = run_test_hook(
+        hook_path,
+        output_dir,
+        config={"ABXPKG_LIB_DIR": str(tmp_path / "lib"), "SNAP_DIR": str(snap_dir)},
+        timeout=30,
+        url=snapshot.url,
+    )
+    process.refresh_from_db()
+    assert process.exit_code == 0, process.stderr
+    return process
+
+
+@pytest.fixture
+def real_crawl_setup_process(snapshot, cached_abxpkg_lib_dir):
+    from archivebox.tests.conftest import run_test_hook
+    from archivebox.services.runner import run_install
+
+    hook_path = Path(str(files("abx_plugins.plugins.chrome").joinpath("on_CrawlSetup__89_chrome_kill_zombies.js")))
+    config_path = Path(str(files("abx_plugins.plugins.chrome").joinpath("config.json")))
+    run_install(plugin_names=["chrome"])
+    binary_env = resolve_abxpkg_binary_env(cached_abxpkg_lib_dir, deps_from=config_path)
+    output_dir = Path(snapshot.crawl.output_dir) / "chrome"
+    process = run_test_hook(
+        hook_path,
+        output_dir,
+        config={
+            **binary_env,
+            "ABXPKG_LIB_DIR": str(cached_abxpkg_lib_dir),
+            "CRAWL_DIR": str(snapshot.crawl.output_dir),
+            "SNAP_DIR": str(snapshot.output_dir),
+            "CHROME_USER_DATA_DIR": str(output_dir / "profile"),
+        },
+        timeout=30,
+    )
+    process.refresh_from_db()
+    assert process.exit_code == 0, process.stderr
+    return process
+
+
+class TestLiveProgressView:
+    @pytest.mark.parametrize("title", ["", "Why Children Aren't Behaving, And What You Can Do About It " * 3])
+    def test_snapshot_header_uses_available_width_on_small_screens(
+        self,
+        snapshot,
+        admin_user,
+        live_server,
+        browser_runtime,
+        real_snapshot_hook_projection,
+        tmp_path,
+        title,
+    ):
+        from datetime import timedelta
+        from urllib.parse import urlsplit
+
+        from playwright.sync_api import expect, sync_playwright
+
+        from archivebox.core.models import Snapshot
+        from archivebox.machine.models import Machine
+        from archivebox.workers.models import ACTIVE_STATE_LEASE_SECONDS
+
+        port = urlsplit(live_server.url).port
+        machine = Machine.current()
+        machine.config = {**machine.config, "BASE_URL": f"http://archivebox.localhost:{port}"}
+        machine.save(update_fields=["config"])
+        # Keep a real capture with its completed hashes hook visible between
+        # hooks, alongside an ordinary queued capture.
+        Snapshot.objects.filter(pk=snapshot.pk).update(
+            title=title,
+            url="https://www.npr.org/sections/ed/2018/06/02/611082566/why-children-arent-behaving-and-what-you-can-do-about-it",
+            permissions="public",
+            status=Snapshot.StatusChoices.STARTED,
+            retry_at=timezone.now() + timedelta(seconds=ACTIVE_STATE_LEASE_SECONDS),
+        )
+        queued = Snapshot.objects.create(crawl=snapshot.crawl, url="https://example.org/queued/" + "long-path/" * 20)
+        origin = f"http://admin.archivebox.localhost:{port}"
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(browser_runtime["chrome_binary"]),
+                args=[*browser_runtime["chrome_args"], "--host-resolver-rules=MAP *.archivebox.localhost 127.0.0.1"],
+            )
+            try:
+                page = browser.new_page(viewport={"width": 390, "height": 844})
+                page.goto(f"{origin}/admin/login/")
+                page.locator("#id_username").fill(admin_user.username)
+                page.locator("#id_password").fill("testpassword")
+                page.locator('input[type="submit"]').click()
+                page.wait_for_url(f"{origin}/admin/")
+                for surface, url in [
+                    ("admin", f"{origin}/admin/crawls/crawl/{snapshot.crawl_id}/change/"),
+                    ("public", f"http://web.archivebox.localhost:{port}{snapshot.get_absolute_url()}"),
+                ]:
+                    page.goto(url)
+                    card = page.locator(f'#progress-monitor .snapshot-item[data-snapshot-id="{snapshot.pk}"]')
+                    expect(card.locator(".snapshot-info")).to_be_visible()
+                    for width in [390, 320, 520, 768, 1280]:
+                        page.set_viewport_size({"width": width, "height": 844})
+                        card.screenshot(path=str(tmp_path / f"progress-{surface}-{width}.png"))
+                        layout = card.evaluate("""card => {
+                            const box = selector => card.querySelector(selector).getBoundingClientRect();
+                            const info = box('.snapshot-info');
+                            const link = box('.snapshot-header-link');
+                            const header = box('.snapshot-header');
+                            const title = box('.snapshot-title');
+                            const url = box('.snapshot-url');
+                            const status = box('.status-badge');
+                            return {infoWidth: info.width, linkWidth: link.width,
+                                headerHeight: header.height, titleHeight: title.height,
+                                titleLineHeight: parseFloat(getComputedStyle(card.querySelector('.snapshot-title')).lineHeight),
+                                urlHeight: url.height, statusTop: status.top, infoBottom: info.bottom,
+                                right: card.getBoundingClientRect().right,
+                                overflow: card.scrollWidth - card.clientWidth};
+                        }""")
+                        assert layout["overflow"] <= 1, layout
+                        assert layout["right"] <= width, layout
+                        assert layout["headerHeight"] < 160, layout
+                        assert layout["titleHeight"] <= layout["titleLineHeight"] * 2 + 1, layout
+                        assert layout["urlHeight"] < 25, layout
+                        if width <= 900:
+                            assert layout["infoWidth"] >= layout["linkWidth"] - 1, layout
+                            assert layout["statusTop"] >= layout["infoBottom"], layout
+                    if surface == "admin":
+                        queued_card = page.locator(f'#progress-monitor .snapshot-item[data-snapshot-id="{queued.pk}"]')
+                        expect(queued_card).to_be_visible()
+                        page.set_viewport_size({"width": 320, "height": 844})
+                        assert queued_card.bounding_box()["height"] < 50
+                print(f"Progress layout screenshots: {tmp_path}")
+            finally:
+                browser.close()
+
+    @pytest.mark.parametrize(
+        ("status", "declared", "output_str", "expected_path"),
+        [
+            ("noresults", False, "Not a shared draw.io diagram", None),
+            ("skipped", False, "Could not load diagram.svg", None),
+            ("failed", False, "Could not load diagram.svg", None),
+            ("failed", True, "Could not finish diagram.svg", "drawio/partial.svg"),
+            ("started", True, "Downloading diagram.svg", "drawio/partial.svg"),
+            ("succeeded", False, "drawio/diagram.svg", "drawio/diagram.svg"),
+        ],
+    )
+    def test_live_progress_links_declared_files_and_successful_legacy_outputs(
+        self,
+        client,
+        admin_user,
+        crawl,
+        snapshot,
+        status,
+        declared,
+        output_str,
+        expected_path,
+    ):
+        from archivebox.core.models import ArchiveResult, Snapshot
+        from archivebox.crawls.models import Crawl
+
+        now = timezone.now()
+        Crawl.objects.filter(pk=crawl.pk).update(status=Crawl.StatusChoices.STARTED, retry_at=now)
+        Snapshot.objects.filter(pk=snapshot.pk).update(status=Snapshot.StatusChoices.STARTED, retry_at=None)
+        output_files = {}
+        if expected_path:
+            output = Path(snapshot.output_dir) / expected_path
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text('<svg xmlns="http://www.w3.org/2000/svg"><title>Partial</title></svg>')
+            if declared:
+                output_files = {"partial.svg": {"size": output.stat().st_size, "mimetype": "image/svg+xml"}}
+        result = ArchiveResult.objects.create(
+            snapshot=snapshot,
+            plugin="drawio",
+            hook_name="on_Snapshot__53_drawio.js",
+            status=status,
+            output_str=output_str,
+            output_files=output_files,
+            start_ts=now,
+        )
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+        assert response.status_code == 200, response.content
+        active_crawl = next(item for item in response.json()["active_crawls"] if item["id"] == str(crawl.pk))
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.pk))
+        plugin = next(item for item in active_snapshot["all_plugins"] if item["id"] == str(result.pk))
+        assert plugin["status"] == status
+        if expected_path:
+            assert plugin["output_path"] == expected_path
+            assert plugin["output_url"].endswith(f"#{expected_path}")
+        else:
+            assert "output_path" not in plugin
+            assert "output_url" not in plugin
+
+    def test_live_progress_uses_existing_indexes_and_cached_totals(self, client, admin_user, crawl, snapshot):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from archivebox.core.models import ArchiveResult, Snapshot
+        from archivebox.crawls.models import Crawl
+
+        Crawl.objects.filter(pk=crawl.pk).update(status=Crawl.StatusChoices.STARTED)
+        Snapshot.objects.filter(pk=snapshot.pk).update(status=Snapshot.StatusChoices.SEALED, downloaded_at=None, output_size=1234)
+        ArchiveResult.objects.create(snapshot=snapshot, plugin="search_backend_sonic", status=ArchiveResult.StatusChoices.QUEUED)
+        client.force_login(admin_user)
+        with CaptureQueriesContext(connection) as queries:
+            response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+        query_sql = [query["sql"] for query in queries]
+        assert response.status_code == 200, response.content
+        payload = response.json()
+        active_crawl = next(item for item in payload["active_crawls"] if item["id"] == str(crawl.pk))
+        assert active_crawl["total_snapshots"] == 1
+        assert active_crawl["crawl_output_size"] is None
+        assert active_crawl["crawl_output_size_display"] == "…"
+        deadline = time.monotonic() + 5
+        while active_crawl["crawl_output_size"] is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+            response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200, response.content
+            active_crawl = next(item for item in response.json()["active_crawls"] if item["id"] == str(crawl.pk))
+        assert active_crawl["cancelled_snapshots"] == 1
+        assert active_crawl["crawl_output_size"] == 1234
+        assert payload["indexing_queued"] == 1
+        assert not any("SUM(" in sql or 'COUNT("core_snapshot"."downloaded_at")' in sql for sql in query_sql)
+        if connection.vendor == "sqlite":
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='index'")
+                indexes = {row[0] for row in cursor.fetchall()}
+            assert "archiveresult_progress_idx" not in indexes
+            assert "snapshot_progress_totals_idx" not in indexes
+            aggregates = [sql for sql in query_sql if "GROUP BY" in sql]
+            assert aggregates
+            with connection.cursor() as cursor:
+                for sql in aggregates:
+                    cursor.execute("EXPLAIN QUERY PLAN " + sql)
+                    plan = " ".join(str(row) for row in cursor.fetchall())
+                    if 'FROM "core_snapshot"' in sql:
+                        assert "COVERING INDEX" in plan, plan
+                    else:
+                        # Both existing status indexes can satisfy this lookup.
+                        # Require a status-keyed search, not one planner choice's
+                        # index name; a full scan must still fail below.
+                        assert re.search(r"SEARCH core_archiveresult USING (?:COVERING )?INDEX \S+ \(status=\?", plan), plan
+                    assert "SCAN " not in plan, plan
+
+        # Size/cancellation samples are shared by tabs while status counts stay
+        # current on every request.
+        Snapshot.objects.filter(pk=snapshot.pk).update(output_size=4321)
+        with CaptureQueriesContext(connection) as cached_queries:
+            for _ in range(5):
+                response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+                assert response.status_code == 200, response.content
+                cached_crawl = next(item for item in response.json()["active_crawls"] if item["id"] == str(crawl.pk))
+                assert cached_crawl["crawl_output_size"] == 1234
+        assert not any("SUM(" in query["sql"] for query in cached_queries)
+
+    def test_live_progress_samples_batches_without_leaking_other_snapshots(self, client, admin_user, crawl, snapshot):
+        from datetime import timedelta
+        from archivebox.core.models import Snapshot
+        from archivebox.crawls.models import Crawl
+
+        Crawl.objects.filter(pk=crawl.pk).update(status=Crawl.StatusChoices.STARTED)
+        now = timezone.now()
+        Snapshot.objects.bulk_create(
+            [
+                Snapshot(
+                    crawl=crawl,
+                    url=f"https://example.com/batch/{i}",
+                    timestamp=str(now.timestamp() + i + 1),
+                    status=Snapshot.StatusChoices.SEALED,
+                    downloaded_at=now if i % 2 else None,
+                    output_size=i + 1,
+                )
+                for i in range(305)
+            ],
+        )
+        # Exercise both a timestamp tie crossing batch boundaries and advancing
+        # to a new timestamp. A started snapshot must not enter sealed totals.
+        Snapshot.objects.filter(crawl=crawl, status=Snapshot.StatusChoices.SEALED).update(modified_at=now)
+        Snapshot.objects.filter(crawl=crawl, output_size__gt=250).update(modified_at=now + timedelta(seconds=1))
+        Snapshot.objects.filter(pk=snapshot.pk).update(output_size=9999)
+        client.force_login(admin_user)
+        deadline = time.monotonic() + 5
+        while True:
+            response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200, response.content
+            totals = next(item for item in response.json()["active_crawls"] if item["id"] == str(crawl.pk))
+            if totals["crawl_output_size"] is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        assert totals["crawl_output_size"] == sum(range(1, 306))
+        assert totals["cancelled_snapshots"] == 153
+        assert totals["total_snapshots"] == 306
+        assert totals["completed_snapshots"] == 305
+
+        Snapshot.objects.filter(pk=snapshot.pk).update(status=Snapshot.StatusChoices.SEALED, config={"PERMISSIONS": "public"})
+        client.logout()
+        deadline = time.monotonic() + 5
+        while True:
+            response = client.get(reverse("live_progress"), {"snapshot_id": str(snapshot.pk)}, HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200, response.content
+            scoped = response.json()["active_crawls"][0]
+            if scoped["crawl_output_size"] is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        assert scoped["total_snapshots"] == 1
+        assert scoped["crawl_output_size"] == 9999
+        assert scoped["cancelled_snapshots"] == 1
+
+    @pytest.mark.parametrize("scope", ["collection", "crawl", "snapshot"])
+    def test_live_progress_does_not_inspect_archive_files(self, client, admin_user, crawl, snapshot, scope):
+        import sys
+        from archivebox.core.models import Snapshot
+        from archivebox.core.routes_util import get_snapshot_host
+        from archivebox.crawls.models import Crawl
+        from archivebox.config.constants import CONSTANTS
+        from archivebox.tests.test_snapshot_output_stacks import save_output
+
+        Crawl.objects.filter(pk=crawl.pk).update(status=Crawl.StatusChoices.STARTED)
+        Snapshot.objects.filter(pk=snapshot.pk).update(status=Snapshot.StatusChoices.STARTED, config={"PERMISSIONS": "public"})
+        for plugin in ("favicon", "screenshot", "readability"):
+            save_output(snapshot, plugin, extra_files=tuple(f"asset-{index}.html" for index in range(64)))
+        client.force_login(admin_user)
+        query = {f"{scope}_id": str(snapshot.pk if scope == "snapshot" else crawl.pk)} if scope != "collection" else {}
+        host = get_snapshot_host(str(snapshot.pk)) if scope == "snapshot" else ADMIN_TEST_HOST
+        # Warm imports/settings, then observe real calls without replacing any
+        # filesystem API or the endpoint under test.
+        assert client.get(reverse("live_progress"), query, HTTP_HOST=host).status_code == 200
+        filesystem_calls = []
+        storage_roots = (CONSTANTS.ARCHIVE_DIR, CONSTANTS.PERSONAS_DIR)
+
+        def observe(frame, event, arg):
+            if event == "call" and frame.f_code.co_name in {"stat", "lstat", "open", "iterdir", "glob", "rglob"}:
+                path = frame.f_locals.get("self")
+                if isinstance(path, Path) and any(path.is_relative_to(root) for root in storage_roots):
+                    filesystem_calls.append(str(path))
+            if event == "c_call" and arg in (os.scandir, os.listdir):
+                filesystem_calls.append(arg.__name__)
+
+        previous_profile = sys.getprofile()
+        sys.setprofile(observe)
+        try:
+            response = client.get(reverse("live_progress"), query, HTTP_HOST=host)
+        finally:
+            sys.setprofile(previous_profile)
+        assert response.status_code == 200, response.content
+        assert filesystem_calls == []
+
+    def test_live_progress_is_read_only_with_expired_machine(self, client, admin_user, crawl, snapshot):
+        from datetime import timedelta
+
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Machine
+
+        machine = Machine.current()
+        old_modified_at = timezone.now() - timedelta(days=8)
+        Machine.objects.filter(pk=machine.pk).update(modified_at=old_modified_at)
+        machine_models._CURRENT_MACHINE = None
+        client.force_login(admin_user)
+
+        with CaptureQueriesContext(connection) as queries:
+            response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200, response.content
+        writes = [query["sql"] for query in queries if query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))]
+        assert writes == []
+        machine.refresh_from_db()
+        assert machine.modified_at == old_modified_at
+
+    def test_gallery_capture_fails_without_live_screencast(self, live_screenshot_command):
+        command, env, variants = live_screenshot_command
+        started = time.monotonic()
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=75)
+        elapsed = time.monotonic() - started
+        assert result.returncode != 0, result.stdout
+        assert "Live progress with a decoded screencast frame was not visible within 60 seconds" in result.stderr
+        assert 60 <= elapsed < 75, (elapsed, result.stderr)
+        assert not any(Path(variant["path"]).exists() for variant in variants)
+
+    @pytest.mark.parametrize("saved_outputs", [False, True])
+    def test_gallery_captures_real_sweeting_screencast(self, crawl, snapshot, live_screenshot_command, saved_outputs):
+        from struct import unpack
+
+        from archivebox.core.models import Snapshot
+        from archivebox.crawls.models import Crawl
+        from archivebox.services.runner import run_due_snapshot
+
+        if saved_outputs:
+            from archivebox.tests.test_snapshot_output_stacks import save_output
+
+            # Recaptures and early-completing plugins leave saved previews next
+            # to the active screencast, as in the published screenshot gallery.
+            for plugin in ("readability", "defuddle", "mercury", "trafilatura", "htmltotext"):
+                save_output(snapshot, plugin)
+
+        config = {
+            "PLUGINS": "chrome,chrome_screencast,title,wget,screenshot,dom,pdf",
+            "PERMISSIONS": "public",
+            "CHROME_HEADLESS": True,
+            "CHROME_SANDBOX": False,
+            "CHROME_ISOLATION": "snapshot",
+            "CHROME_TIMEOUT": 90,
+            "CHROME_PAGELOAD_TIMEOUT": 90,
+            "CHROME_DELAY_AFTER_LOAD": 30,
+            "TIMEOUT": 90,
+        }
+        Crawl.objects.filter(pk=crawl.pk).update(
+            status=Crawl.StatusChoices.STARTED,
+            retry_at=timezone.now(),
+            urls=snapshot.url,
+            config=config,
+        )
+        Snapshot.objects.filter(pk=snapshot.pk).update(status=Snapshot.StatusChoices.QUEUED, retry_at=timezone.now(), config=config)
+        snapshot = Snapshot.objects.get(pk=snapshot.pk)
+        errors = []
+
+        def run_snapshot():
+            try:
+                assert run_due_snapshot(snapshot, lock_seconds=120) is True
+            except BaseException as err:
+                errors.append(err)
+
+        runner = Thread(target=run_snapshot, name="archivebox-test-marketing-capture")
+        command, env, variants = live_screenshot_command
+        capture = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        runner.start()
+        try:
+            stdout, stderr = capture.communicate(timeout=75)
+            assert capture.returncode == 0, stderr
+            report = json.loads(stdout)
+            assert report["checks"]["screencastImageLoaded"] is True
+            captures = report["checks"]["liveProgressCaptures"]
+            assert len(captures) == len(variants)
+            for saved, variant in zip(captures, variants, strict=True):
+                assert saved["ready"] is True, saved
+                assert saved["screencastImageHasContent"] is True, saved
+                assert saved["snapshotId"] == str(snapshot.pk).replace("-", "")
+                assert saved["runningExtractors"] > 0
+                assert saved["screencastImageUrl"].split("?")[0].endswith(f"/snapshot/{snapshot.pk}/screencast.jpg")
+                png = Path(variant["path"]).read_bytes()
+                assert png[:8] == b"\x89PNG\r\n\x1a\n"
+                assert unpack(">II", png[16:24]) == (variant["width"], variant["height"])
+            Path(variants[0]["path"]).with_suffix(".json").write_text(stdout)
+        finally:
+            if capture.poll() is None:
+                capture.terminate()
+                capture.communicate(timeout=10)
+            runner.join(timeout=120)
+        assert not runner.is_alive()
+        assert errors == []
+
+    def test_collection_summary_reports_stored_sizes(self, client, admin_user, snapshot):
+        import time
+        from django.core.cache import cache
+        from django.db.models import Count, Sum
+        from archivebox.core.models import Snapshot
+
+        Snapshot.objects.filter(pk=snapshot.pk).update(output_size=12345)
+        expected = Snapshot.objects.aggregate(snapshots=Count("*"), bytes=Sum("output_size"))
+        cache.delete_many(["progress-collection:all", "progress-collection:all:refresh"])
+        client.force_login(admin_user)
+        deadline = time.monotonic() + 5
+        while True:
+            response = client.get(reverse("live_progress"), {"collection": "1"}, HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200
+            summary = response.json().get("collection")
+            if summary is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        assert summary is not None
+        assert summary["snapshots"] == expected["snapshots"]
+        assert summary["bytes"] == expected["bytes"]
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        if connection.vendor == "sqlite":
+            with connection.cursor() as cursor:
+                cursor.execute("EXPLAIN QUERY PLAN SELECT COUNT(*), SUM(output_size) FROM core_snapshot")
+                plan = " ".join(str(row) for row in cursor.fetchall())
+            assert "COVERING INDEX" in plan, plan
+
+        timings = []
+        with CaptureQueriesContext(connection) as queries:
+            for _ in range(20):
+                start = time.perf_counter()
+                response = client.get(reverse("live_progress"), {"collection": "1"}, HTTP_HOST=ADMIN_TEST_HOST)
+                timings.append((time.perf_counter() - start) * 1000)
+                assert response.status_code == 200
+                assert response.json()["collection"] == summary
+        assert not any('AS "bytes"' in query["sql"] for query in queries)
+        print(f"cached progress response: median={sorted(timings)[10]:.1f}ms max={max(timings):.1f}ms")
+
+    def test_collection_summary_is_scoped_to_staff_owner(self, client, admin_user, snapshot):
+        import time
+        from django.core.cache import cache
+        from archivebox.core.models import Snapshot
+
+        admin_user.is_superuser = False
+        admin_user.save(update_fields=["is_superuser"])
+        from django.contrib.auth import get_user_model
+
+        # Give the snapshot another owner; staff must not learn its size/count.
+        snapshot.crawl.created_by = get_user_model().objects.create_user(username="other-summary-owner")
+        snapshot.crawl.save(update_fields=["created_by"])
+        Snapshot.objects.filter(pk=snapshot.pk).update(output_size=12345)
+        cache.delete_many([f"progress-collection:{admin_user.pk}", f"progress-collection:{admin_user.pk}:refresh"])
+        client.force_login(admin_user)
+        deadline = time.monotonic() + 5
+        while True:
+            response = client.get(reverse("live_progress"), {"collection": "1"}, HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200
+            summary = response.json().get("collection")
+            if summary is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        assert summary is not None
+        assert summary["snapshots"] == 0
+        assert summary["bytes"] == 0
+
+    def test_live_progress_rejects_unauthenticated_unscoped_request(self, client):
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 403
+        assert response.json() == {"error": "Permission denied"}
+        assert b"orchestrator_running" not in response.content
+        assert b"active_crawls" not in response.content
+        assert b"traceback" not in response.content
+
+    def test_admin_live_progress_path_does_not_bypass_admin_auth(self, client):
+        response = client.get("/admin/live-progress/", HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code in (302, 403, 404)
+        assert b"orchestrator_running" not in response.content
+        assert b"active_crawls" not in response.content
+        assert b"traceback" not in response.content
+
+    @override_settings(DEBUG=False)
+    def test_live_progress_error_response_hides_traceback_without_debug(self, client, admin_user, crawl):
+        from archivebox.crawls.models import Crawl
+
+        Crawl.objects.filter(pk=crawl.pk).update(
+            status=Crawl.StatusChoices.STARTED,
+            config={"CRAWL_MAX_URLS": "not-an-integer"},
+            retry_at=timezone.now(),
+            modified_at=timezone.now(),
+        )
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 500
+        payload = response.json()
+        assert "error" in payload
+        assert "traceback" not in payload
+        assert payload["active_crawls"] == []
+
+    def test_live_progress_excludes_old_archiveresults_from_previous_snapshot_run(
+        self,
+        client,
+        admin_user,
+        crawl,
+        snapshot,
+        real_snapshot_hook_projection,
+    ):
+        from datetime import timedelta
+        from archivebox.core.models import ArchiveResult
+        from archivebox.crawls.models import Crawl
+        from archivebox.core.models import Snapshot
+
+        client.force_login(admin_user)
+
+        now = timezone.now()
+        Crawl.objects.filter(pk=crawl.pk).update(
+            status=Crawl.StatusChoices.STARTED,
+            retry_at=now,
+            modified_at=now,
+        )
+        Snapshot.objects.filter(pk=snapshot.pk).update(
+            status=Snapshot.StatusChoices.STARTED,
+            retry_at=None,
+            downloaded_at=now - timedelta(minutes=1),
+            modified_at=now,
+        )
+
+        old_process, finished_result = real_snapshot_hook_projection
+        ArchiveResult.objects.filter(pk=finished_result.pk).update(
+            start_ts=now - timedelta(hours=1, minutes=1),
+            end_ts=now - timedelta(hours=1),
+        )
+        type(old_process).objects.filter(pk=old_process.pk).update(
+            started_at=now - timedelta(hours=1, minutes=1),
+            ended_at=now - timedelta(hours=1),
+            modified_at=now - timedelta(hours=1),
+        )
+        ArchiveResult.objects.create(
+            snapshot=snapshot,
+            plugin="chrome",
+            hook_name="on_Snapshot__11_chrome_wait",
+            status=ArchiveResult.StatusChoices.QUEUED,
+        )
+
+        response = client.get("/progress.json", HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200, response.content
+        payload = response.json()
+        active_crawl = next(item for item in payload["active_crawls"] if item["id"] == str(crawl.pk))
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.pk))
+        plugin_names = [item["plugin"] for item in active_snapshot["all_plugins"]]
+        assert plugin_names == ["chrome"]
+
+    def test_live_progress_does_not_hide_active_snapshot_results_when_modified_at_moves(
+        self,
+        client,
+        admin_user,
+        crawl,
+        snapshot,
+        blocking_http_server,
+    ):
+        from datetime import timedelta
+        from archivebox.core.models import ArchiveResult
+        from archivebox.crawls.models import Crawl
+        from archivebox.core.models import Snapshot
+        from archivebox.services.runner import run_due_snapshot
+
+        client.force_login(admin_user)
+
+        now = timezone.now()
+        Crawl.objects.filter(pk=crawl.pk).update(
+            status=Crawl.StatusChoices.STARTED,
+            retry_at=now,
+            modified_at=now,
+        )
+        Snapshot.objects.filter(pk=snapshot.pk).update(
+            status=Snapshot.StatusChoices.QUEUED,
+            retry_at=now,
+            created_at=now - timedelta(hours=2),
+            downloaded_at=None,
+            url=blocking_http_server.url,
+            config={"PLUGINS": "wget"},
+        )
+        snapshot.refresh_from_db()
+        errors = []
+
+        def run_snapshot():
+            try:
+                assert run_due_snapshot(snapshot, lock_seconds=60) is True
+            except BaseException as err:
+                errors.append(err)
+            finally:
+                blocking_http_server.request_started.set()
+
+        runner = Thread(target=run_snapshot, name="archivebox-test-wget-runner")
+        runner.start()
+        try:
+            blocking_http_server.request_started.wait()
+            assert errors == []
+            result = ArchiveResult.objects.get(snapshot=snapshot, plugin="wget")
+            assert result.status == ArchiveResult.StatusChoices.STARTED
+            Snapshot.objects.filter(pk=snapshot.pk).update(modified_at=timezone.now())
+
+            response = client.get("/progress.json", HTTP_HOST=ADMIN_TEST_HOST)
+
+            assert response.status_code == 200, response.content
+            payload = response.json()
+            active_crawl = next(item for item in payload["active_crawls"] if item["id"] == str(crawl.pk))
+            active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.pk))
+            plugin_names = [item["plugin"] for item in active_snapshot["all_plugins"]]
+            assert plugin_names == ["wget"]
+        finally:
+            blocking_http_server.release_response.set()
+            runner.join()
+
+        assert errors == []
+        result.refresh_from_db()
+        assert result.status in (ArchiveResult.StatusChoices.SUCCEEDED, ArchiveResult.StatusChoices.NORESULTS)
+
+    @pytest.mark.parametrize("keep_frames", [0, 1])
+    def test_live_progress_keeps_still_browser_frame_while_screencast_runs(
+        self,
+        client,
+        admin_user,
+        crawl,
+        snapshot,
+        painted_http_server,
+        cached_abxpkg_lib_dir,
+        keep_frames,
+        tmp_path,
+    ):
+        import hashlib
+        import sys
+        import time
+
+        from archivebox.config.common import get_config
+        from archivebox.machine.models import Machine, Process
+        from archivebox.core.models import Snapshot
+        from archivebox.crawls.models import Crawl
+        from archivebox.services.runner import run_due_snapshot
+
+        # Provision the real browser before timing navigation; a cold Chromium
+        # download is dependency setup, not part of the screencast assertion.
+        resolve_abxpkg_chrome_env(cached_abxpkg_lib_dir)
+        machine = Machine.current()
+        machine.config = {**machine.config, "TMP_DIR": str(tmp_path / "local-runtime")}
+        machine.save(update_fields=["config"])
+
+        now = timezone.now()
+        Crawl.objects.filter(pk=crawl.pk).update(
+            status=Crawl.StatusChoices.STARTED,
+            retry_at=now,
+            urls=painted_http_server.url,
+            config={"PLUGINS": "chrome,chrome_screencast", "CHROME_ISOLATION": "snapshot"},
+        )
+        Snapshot.objects.filter(pk=snapshot.pk).update(
+            status=Snapshot.StatusChoices.QUEUED,
+            retry_at=now,
+            url=painted_http_server.url,
+            config={
+                "PLUGINS": "chrome,chrome_screencast",
+                "CHROME_HEADLESS": True,
+                "CHROME_SANDBOX": False,
+                "CHROME_ISOLATION": "snapshot",
+                "CHROME_TIMEOUT": 90,
+                "CHROME_PAGELOAD_TIMEOUT": 90,
+                "CHROME_DELAY_AFTER_LOAD": 30,
+                "CHROME_SCREENCAST_KEEP": keep_frames,
+                "TIMEOUT": 90,
+            },
+        )
+        snapshot.refresh_from_db()
+        durable_dir = Path(snapshot.output_dir) / "chrome_screencast"
+        snapshot_key = hashlib.sha256(os.path.abspath(snapshot.output_dir).encode()).hexdigest()
+        frame = Path(get_config(snapshot=snapshot).TMP_DIR) / "chrome_screencast" / snapshot_key / "latest.jpg"
+        errors = []
+
+        def run_snapshot():
+            try:
+                assert run_due_snapshot(snapshot, lock_seconds=120) is True
+            except BaseException as err:
+                errors.append(err)
+
+        runner = Thread(target=run_snapshot, name="archivebox-test-screencast-runner")
+        runner.start()
+        writer = None
+        try:
+            assert painted_http_server.request_started.wait(timeout=60)
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                assert errors == []
+                assert not list(durable_dir.glob("*.jpg")), "Live frames must not churn durable archive storage"
+                if writer is None and frame.is_file():
+                    assert frame.read_bytes().startswith(b"\xff\xd8\xff")
+                    process = Process.objects.get(pwd=str(durable_dir), status=Process.StatusChoices.RUNNING)
+                    assert process.pid and process.started_at
+                    # The producer now samples even static pages. Pause the real
+                    # writer to exercise serving an aged frame while it is alive.
+                    writer = process.proc
+                    assert writer is not None
+                    assert any("chrome_screencast" in arg for arg in writer.cmdline())
+                    writer.suspend()
+                if frame.is_file() and time.time() - frame.stat().st_mtime > 16:
+                    break
+                time.sleep(0.1)
+            assert frame.is_file()
+            assert frame.read_bytes().startswith(b"\xff\xd8\xff")
+            assert time.time() - frame.stat().st_mtime > 16
+            client.force_login(admin_user)
+            process_probes = []
+
+            def observe(frame, event, arg):
+                if event == "call" and "/psutil/" in frame.f_code.co_filename:
+                    process_probes.append((frame.f_code.co_filename, frame.f_code.co_name))
+
+            # cProfile observes other threads on Python 3.13, including the
+            # runner's legitimate memory admission checks. Observe this request
+            # thread only, without replacing any process API.
+            previous_profile = sys.getprofile()
+            sys.setprofile(observe)
+            try:
+                response = client.get("/progress.json", HTTP_HOST=ADMIN_TEST_HOST)
+            finally:
+                sys.setprofile(previous_profile)
+            assert response.status_code == 200, response.content
+            assert process_probes == []
+            active_crawl = next(item for item in response.json()["active_crawls"] if item["id"] == str(crawl.pk))
+            assert active_crawl["screencast_url"].startswith(f"/api/v1/core/snapshot/{snapshot.pk}/screencast.jpg")
+            active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.pk))
+            assert active_snapshot["screencast_url"] == active_crawl["screencast_url"]
+            image_response = client.get(active_crawl["screencast_url"], HTTP_HOST=ADMIN_TEST_HOST)
+            assert image_response.status_code == 200
+            assert b"".join(image_response.streaming_content) == frame.read_bytes()
+        finally:
+            try:
+                if writer is not None and writer.is_running():
+                    writer.resume()
+            finally:
+                runner.join(timeout=120)
+        assert not runner.is_alive()
+        assert errors == []
+        assert not frame.exists()
+        assert not list(frame.parent.glob("*.jpg"))
+        assert not (durable_dir / "latest.jpg").exists()
+        kept_frames = list(durable_dir.glob("frame-*.jpg"))
+        assert len(kept_frames) == keep_frames
+        assert all(saved.read_bytes().startswith(b"\xff\xd8\xff") for saved in kept_frames)
+        for saved in kept_frames:
+            from archivebox.core.routes_util import build_snapshot_url
+            from urllib.parse import urlsplit
+
+            saved_url = urlsplit(build_snapshot_url(str(snapshot.pk), f"chrome_screencast/{saved.name}"))
+            response = client.get(saved_url.path, HTTP_HOST=saved_url.netloc)
+            assert response.status_code == 200
+            assert b"".join(response.streaming_content) == saved.read_bytes()
+
+    def test_live_progress_keeps_concurrent_snapshot_frames_separate(
+        self,
+        client,
+        admin_user,
+        crawl,
+        painted_http_server,
+        cached_abxpkg_lib_dir,
+        tmp_path,
+    ):
+        import hashlib
+
+        import psutil
+
+        from archivebox.config.common import get_config
+        from archivebox.core.models import Snapshot
+        from archivebox.crawls.models import Crawl
+        from archivebox.machine.models import Machine, Process
+        from archivebox.services.runner import run_crawl
+
+        resolve_abxpkg_chrome_env(cached_abxpkg_lib_dir)
+        machine = Machine.current()
+        machine.config = {**machine.config, "TMP_DIR": str(tmp_path / "local-runtime")}
+        machine.save(update_fields=["config"])
+        config = {
+            "PLUGINS": "chrome,chrome_screencast",
+            "CHROME_HEADLESS": True,
+            "CHROME_SANDBOX": False,
+            "CHROME_ISOLATION": "snapshot",
+            "CRAWL_MAX_CONCURRENT_SNAPSHOTS": 2,
+            "CHROME_TIMEOUT": 90,
+            "CHROME_PAGELOAD_TIMEOUT": 90,
+            "CHROME_DELAY_AFTER_LOAD": 30,
+            "CHROME_SCREENCAST_KEEP": 0,
+            "TIMEOUT": 90,
+        }
+        Crawl.objects.filter(pk=crawl.pk).update(status=Crawl.StatusChoices.STARTED, retry_at=timezone.now(), config=config)
+        snapshots = [
+            Snapshot.objects.create(
+                crawl=crawl,
+                url=f"{painted_http_server.url}?capture={index}",
+                config=config,
+                retry_at=timezone.now(),
+            )
+            for index in range(3)
+        ]
+        # Three real captures allow the runner's initial solo warmup; if an
+        # earlier capture already taught its cost, the first pair can overlap.
+        frames = [
+            get_config(snapshot=snapshot).TMP_DIR
+            / "chrome_screencast"
+            / hashlib.sha256(os.path.abspath(snapshot.output_dir).encode()).hexdigest()
+            / "latest.jpg"
+            for snapshot in snapshots
+        ]
+        errors = []
+
+        def run_snapshots():
+            try:
+                run_crawl(str(crawl.pk), snapshot_ids=[str(item.pk) for item in snapshots])
+            except BaseException as err:
+                errors.append(err)
+
+        runner = Thread(target=run_snapshots)
+        runner.start()
+        writers = []
+        try:
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline and sum(frame.is_file() for frame in frames) < 2:
+                assert not errors, errors
+                time.sleep(0.1)
+            active = [(snapshot, frame) for snapshot, frame in zip(snapshots, frames) if frame.is_file()]
+            assert len(active) == 2
+            # Each producer atomically replaces latest.jpg. Pause both real
+            # writers so the response and the later path read observe the same
+            # frame, rather than two valid frames from one live capture.
+            for snapshot, frame in active:
+                process = Process.objects.get(
+                    pwd=str(Path(snapshot.output_dir) / "chrome_screencast"),
+                    status=Process.StatusChoices.RUNNING,
+                )
+                assert process.pid and process.started_at
+                writer = process.proc
+                assert writer is not None
+                assert any("chrome_screencast" in arg for arg in writer.cmdline())
+                writers.append(writer)
+                writer.suspend()
+            assert len({writer.pid for writer in writers}) == 2
+            while time.monotonic() < deadline and any(writer.status() != psutil.STATUS_STOPPED for writer in writers):
+                assert not errors, errors
+                time.sleep(0.1)
+            assert all(writer.status() == psutil.STATUS_STOPPED for writer in writers)
+            assert all(frame.read_bytes().startswith(b"\xff\xd8\xff") for _, frame in active)
+            client.force_login(admin_user)
+            response = client.get("/progress.json", HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200, response.content
+            active_crawl = next(item for item in response.json()["active_crawls"] if item["id"] == str(crawl.pk))
+            # Queued rows use the public progress API's compact list form.
+            rows = {item["id"]: item for item in active_crawl["active_snapshots"] if isinstance(item, dict)}
+            urls = []
+            for snapshot, frame in active:
+                assert rows[str(snapshot.pk)]["status"] == "started"
+                url = rows[str(snapshot.pk)]["screencast_url"]
+                assert url.split("?")[0] == f"/api/v1/core/snapshot/{snapshot.pk}/screencast.jpg"
+                image = client.get(url, HTTP_HOST=ADMIN_TEST_HOST)
+                assert image.status_code == 200
+                assert b"".join(image.streaming_content) == frame.read_bytes()
+                urls.append(url)
+            assert len(set(urls)) == 2
+            assert active_crawl["screencast_url"] in urls
+        finally:
+            try:
+                for writer in writers:
+                    try:
+                        writer.resume()
+                    except psutil.NoSuchProcess:
+                        pass
+            finally:
+                runner.join(timeout=120)
+        assert not runner.is_alive()
+        assert not errors, errors
+        assert not any(frame.exists() for frame in frames)
+
+    def test_live_progress_hides_finished_cancelled_crawl(self, client, admin_user, crawl, snapshot):
+        from archivebox.core.models import ArchiveResult, Snapshot
+        from archivebox.crawls.models import Crawl
+
+        now = timezone.now()
+        Crawl.objects.filter(pk=crawl.pk).update(
+            status=Crawl.StatusChoices.SEALED,
+            retry_at=None,
+            modified_at=now,
+        )
+        Snapshot.objects.filter(pk=snapshot.pk).update(
+            status=Snapshot.StatusChoices.SEALED,
+            retry_at=None,
+            downloaded_at=None,
+            modified_at=now,
+        )
+        ArchiveResult.objects.create(
+            snapshot=snapshot,
+            plugin="singlefile",
+            hook_name="on_Snapshot__50_singlefile",
+            status=ArchiveResult.StatusChoices.QUEUED,
+        )
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["active_crawls"] == []
+        assert payload["downloads_queued"] == 0
+        assert payload["crawls_active"] == 0
+        assert payload["archiveresults_queued"] == 1
+        assert "crawls_started" not in payload
+        assert "crawls_pending" not in payload
+        assert "downloads_started" not in payload
+        assert "downloads_pending" not in payload
+
+    def test_live_progress_scope_accepts_compact_and_dashed_snapshot_ids(self, client, admin_user, snapshot):
+        from archivebox.core.models import Snapshot
+
+        Snapshot.objects.filter(pk=snapshot.pk).update(status=Snapshot.StatusChoices.STARTED)
+        compact_id = str(snapshot.id).replace("-", "")
+        dashed_id = str(uuid.UUID(hex=compact_id))
+
+        client.force_login(admin_user)
+        for snapshot_id in (compact_id, dashed_id):
+            response = client.get(reverse("live_progress"), {"snapshot_id": snapshot_id}, HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["scope"]["snapshot_id"] == compact_id
+            assert payload["active_crawls"]
+
+    def test_public_snapshot_progress_does_not_leak_private_crawl_details(self, client, admin_user):
+        from archivebox.core.models import Snapshot
+        from archivebox.crawls.models import Crawl
+        from archivebox.personas.models import Persona
+
+        persona = Persona.objects.create(name="private-work-login")
+        crawl = Crawl.objects.create(
+            urls="https://private-seed.example/inbox?token=seed-secret\nhttps://public-page.example/",
+            tags_str="private-crawl-tag",
+            created_by=admin_user,
+            persona=persona,
+            status=Crawl.StatusChoices.STARTED,
+            config={"PERMISSIONS": "private"},
+        )
+        snapshot = Snapshot.objects.create(
+            url="https://public-page.example/",
+            crawl=crawl,
+            status=Snapshot.StatusChoices.STARTED,
+        )
+        Snapshot.objects.filter(pk=snapshot.pk).update(config={"PERMISSIONS": "public"})
+
+        response = client.get(reverse("live_progress"), {"snapshot_id": str(snapshot.pk)}, HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200, response.content
+        payload = response.json()
+        assert payload["is_admin"] is False
+        scoped = payload["active_crawls"][0]
+        assert [item["id"] for item in scoped["active_snapshots"]] == [str(snapshot.pk).replace("-", "")]
+        assert scoped["label"] == "https://public-page.example/"
+        body = response.content.decode()
+        for private_value in (
+            "private-seed.example",
+            "seed-secret",
+            "private-crawl-tag",
+            "private-work-login",
+            f"/admin/personas/persona/{persona.pk}",
+        ):
+            assert private_value not in body, private_value
+
+        client.force_login(admin_user)
+        admin_scoped = client.get(reverse("live_progress"), {"snapshot_id": str(snapshot.pk)}, HTTP_HOST=ADMIN_TEST_HOST).json()[
+            "active_crawls"
+        ][0]
+        assert admin_scoped["urls_preview"].startswith("https://private-seed.example/")
+        assert admin_scoped["tags"] == ["private-crawl-tag"]
+        assert admin_scoped["persona"] == "private-work-login"
+
+    def test_live_progress_scope_accepts_compact_and_dashed_crawl_ids(self, client, admin_user, crawl):
+        compact_id = str(crawl.id).replace("-", "")
+        dashed_id = str(uuid.UUID(hex=compact_id))
+
+        client.force_login(admin_user)
+        for crawl_id in (compact_id, dashed_id):
+            response = client.get(reverse("live_progress"), {"crawl_id": crawl_id}, HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["scope"]["crawl_id"] == compact_id
+            assert payload["active_crawls"]
+
+    def test_live_progress_shows_old_paused_crawl_with_due_snapshot_work(self, client, admin_user, crawl, snapshot):
+        from datetime import timedelta
+        from archivebox.crawls.models import Crawl
+        from archivebox.core.models import Snapshot
+
+        old_timestamp = timezone.now() - timedelta(days=2)
+        Crawl.objects.filter(pk=crawl.pk).update(
+            status=Crawl.StatusChoices.PAUSED,
+            created_at=old_timestamp,
+            modified_at=old_timestamp,
+            retry_at=None,
+        )
+        Snapshot.objects.filter(pk=snapshot.pk).update(
+            status=Snapshot.StatusChoices.QUEUED,
+            retry_at=timezone.now(),
+            modified_at=timezone.now(),
+        )
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200, response.content
+        payload = response.json()
+        active_crawl = next(item for item in payload["active_crawls"] if item["id"] == str(crawl.pk))
+        assert active_crawl["status"] == Crawl.StatusChoices.PAUSED
+        assert active_crawl["pending_snapshots"] == 1
+        assert active_crawl["active_snapshots"] == [
+            [
+                str(snapshot.pk),
+                "https://example.com",
+            ],
+        ]
+
+    def test_live_progress_reports_real_orchestrator_process_running(
+        self,
+        client,
+        admin_user,
+        initialized_archive,
+    ):
+        import cProfile
+        import pstats
+
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Machine, Process, psutil
+
+        machine_models._CURRENT_MACHINE = None
+        cmd = ["archivebox", "manage", "shell"]
+        popen = run_archivebox_cmd(
+            ["manage", "shell"],
+            cwd=initialized_archive,
+            env=cli_env(live=True),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            capture_output=False,
+            wait=False,
+        )
+        try:
+            os_process = psutil.Process(popen.pid)
+            Process.objects.create(
+                machine=Machine.current(),
+                process_type=Process.TypeChoices.ORCHESTRATOR,
+                status=Process.StatusChoices.RUNNING,
+                pid=popen.pid,
+                cmd=cmd,
+                env={},
+                started_at=datetime.fromtimestamp(os_process.create_time(), tz=dt_timezone.utc),
+            )
+
+            client.force_login(admin_user)
+            # Bound liveness work to the one runner candidate, not historical
+            # Process rows or each hook in the collection.
+            profile = cProfile.Profile()
+            with profile:
+                response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["orchestrator_running"] is True
+            assert payload["orchestrator_pid"] == popen.pid
+            process_probes = [
+                stats[0]
+                for (source, _line, function), stats in pstats.Stats(profile).stats.items()
+                if source.endswith("machine/models.py") and function == "proc"
+            ]
+            assert process_probes == [1]
+        finally:
+            assert popen.stdin is not None
+            popen.stdin.close()
+            popen.wait(timeout=20)
+
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+        assert response.status_code == 200
+        assert response.json()["orchestrator_running"] is False
+        assert response.json()["orchestrator_pid"] is None
+        assert Process.objects.filter(pid=popen.pid, status=Process.StatusChoices.RUNNING).exists(), (
+            "A GET must not rewrite process history"
+        )
+
+    def test_live_progress_does_not_count_interrupted_results_as_active_downloads(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_snapshot_hook_projection,
+    ):
+        from archivebox.core.models import ArchiveResult, Snapshot
+        from archivebox.crawls.models import Crawl
+        from archivebox.machine.models import Process
+
+        process, result = real_snapshot_hook_projection
+        assert process.status == Process.StatusChoices.EXITED
+        assert process.exit_code == 0
+        # Recovery preserves the old result projection and queues a fresh
+        # capture; the completed process is no longer an active download.
+        result.status = ArchiveResult.StatusChoices.STARTED
+        result.end_ts = None
+        result.save(update_fields=["status", "end_ts"])
+        Snapshot.objects.filter(pk=snapshot.pk).update(status=Snapshot.StatusChoices.QUEUED)
+        Crawl.objects.filter(pk=snapshot.crawl_id).update(status=Crawl.StatusChoices.STARTED)
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+        assert response.status_code == 200
+        assert response.json()["downloads_active"] == 0
+        result.refresh_from_db()
+        assert result.status == ArchiveResult.StatusChoices.STARTED
+        assert result.end_ts is None
+
+    def test_live_progress_ignores_unscoped_running_processes_when_no_crawls(
+        self,
+        client,
+        admin_user,
+        real_unscoped_hook_process,
+    ):
+        import os
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Process
+
+        machine_models._CURRENT_MACHINE = None
+        process = real_unscoped_hook_process
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = os.getpid()
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "ended_at"])
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["active_crawls"] == []
+        assert payload["total_workers"] == 0
+
+    def test_live_progress_does_not_clean_stale_running_processes(self, client, admin_user, real_unscoped_hook_process):
+        from datetime import timedelta
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Process
+
+        machine_models._CURRENT_MACHINE = None
+        proc = real_unscoped_hook_process
+        proc.status = Process.StatusChoices.RUNNING
+        proc.pid = 999999
+        proc.started_at = timezone.now() - timedelta(days=2)
+        proc.ended_at = None
+        proc.save(update_fields=["status", "pid", "started_at", "ended_at"])
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        proc.refresh_from_db()
+        assert proc.status == Process.StatusChoices.RUNNING
+        assert proc.ended_at is None
+        assert response.json()["total_workers"] == 0
+
+    def test_live_progress_routes_crawl_process_rows_to_crawl_setup(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_crawl_setup_process,
+    ):
+        import os
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Process
+
+        machine_models._CURRENT_MACHINE = None
+        pid = os.getpid()
+        process = real_crawl_setup_process
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = pid
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "ended_at"])
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        payload = response.json()
+        active_crawl = next(crawl for crawl in payload["active_crawls"] if crawl["id"] == str(snapshot.crawl_id))
+        setup_entry = next(item for item in active_crawl["setup_plugins"] if item["source"] == "process")
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.id))
+        assert setup_entry["label"] == "chrome kill zombies"
+        assert setup_entry["status"] == "started"
+        assert active_crawl["worker_pid"] == pid
+        assert active_snapshot["all_plugins"] == []
+
+    def test_live_progress_uses_snapshot_process_rows_before_archiveresults(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_snapshot_hook_projection,
+    ):
+        import os
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Process
+
+        machine_models._CURRENT_MACHINE = None
+        pid = os.getpid()
+        process, result = real_snapshot_hook_projection
+        result.delete()
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = pid
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "ended_at"])
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        payload = response.json()
+        active_crawl = next(crawl for crawl in payload["active_crawls"] if crawl["id"] == str(snapshot.crawl_id))
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.id))
+        assert active_snapshot["all_plugins"][0]["source"] == "process"
+        assert active_snapshot["all_plugins"][0]["label"] == "hashes"
+        assert active_snapshot["all_plugins"][0]["status"] == "started"
+        assert active_snapshot["worker_pid"] == pid
+
+    def test_live_progress_renders_queued_snapshot_whose_hooks_already_spawned(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_snapshot_hook_projection,
+    ):
+        # The runner spawns hooks before the DB row leaves QUEUED. Such a row
+        # takes the full payload path, so the compact queued query must still
+        # carry every column its view_url needs (fs_version, timestamp, dates).
+        import os
+        import archivebox.machine.models as machine_models
+        from django.utils import timezone
+        from archivebox.core.models import Snapshot
+        from archivebox.machine.models import Process
+
+        machine_models._CURRENT_MACHINE = None
+        process, result = real_snapshot_hook_projection
+        result.delete()
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = os.getpid()
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "ended_at"])
+        Snapshot.objects.filter(pk=snapshot.pk).update(status=Snapshot.StatusChoices.QUEUED, retry_at=timezone.now())
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200, response.content[:300]
+        active_crawl = next(crawl for crawl in response.json()["active_crawls"] if crawl["id"] == str(snapshot.crawl_id))
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.id))
+        assert active_snapshot["status"] == Snapshot.StatusChoices.QUEUED
+        assert str(snapshot.id).replace("-", "")[-12:] in active_snapshot["view_url"]
+        assert active_snapshot["all_plugins"][0]["label"] == "hashes"
+
+    def test_live_progress_filters_process_query_to_displayed_crawls_without_hiding_older_live_hooks(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_snapshot_hook_projection,
+        real_unscoped_hook_process,
+    ):
+        import os
+        from datetime import timedelta
+
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Process
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        process, result = real_snapshot_hook_projection
+        machine_models._CURRENT_MACHINE = process.machine
+        result.delete()
+        old_started_at = timezone.now() - timedelta(hours=1)
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = os.getpid()
+        process.started_at = old_started_at
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "started_at", "ended_at", "modified_at"])
+        Process.objects.filter(pk=process.pk).update(modified_at=old_started_at)
+
+        unrelated = real_unscoped_hook_process
+        unrelated.status = Process.StatusChoices.RUNNING
+        unrelated.pid = os.getpid()
+        unrelated.ended_at = None
+        unrelated.save(update_fields=["status", "pid", "ended_at", "modified_at"])
+        client.force_login(admin_user)
+        with CaptureQueriesContext(connection) as queries:
+            response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        payload = response.json()
+        active_crawl = next(crawl for crawl in payload["active_crawls"] if crawl["id"] == str(snapshot.crawl_id))
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.id))
+        assert active_snapshot["worker_pid"] == os.getpid()
+        assert payload["total_workers"] == 1
+
+        running_process_sql = next(
+            query["sql"]
+            for query in queries.captured_queries
+            if 'FROM "machine_process"' in query["sql"]
+            and '"machine_process"."process_type" IN' in query["sql"]
+            and '"machine_process"."status" = \'running\'' in query["sql"]
+        )
+        assert '"machine_process"."pwd" REGEXP' in running_process_sql
+        assert str(snapshot.id) in running_process_sql
+        assert str(unrelated.pk) not in running_process_sql
+
+    def test_live_progress_keeps_started_snapshots_in_a_stable_order_while_heartbeats_move_modified_at(
+        self,
+        client,
+        admin_user,
+        crawl,
+        snapshot,
+    ):
+        from archivebox.core.models import Snapshot
+        from archivebox.crawls.models import Crawl
+
+        # The runner heartbeats modified_at on every capture it works on, so
+        # ordering by it swapped the displayed snapshots (and all their hook
+        # badges) back and forth between polls.
+        Crawl.objects.filter(pk=crawl.pk).update(status=Crawl.StatusChoices.STARTED)
+        second = Snapshot.objects.create(url="https://example.org", crawl=crawl, status=Snapshot.StatusChoices.STARTED)
+        client.force_login(admin_user)
+
+        def displayed_order():
+            response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200
+            active_crawl = next(item for item in response.json()["active_crawls"] if item["id"] == str(crawl.pk))
+            return [item["id"] if isinstance(item, dict) else item[0] for item in active_crawl["active_snapshots"]]
+
+        expected = [str(snapshot.pk).replace("-", ""), str(second.pk).replace("-", "")]
+        for heartbeat in (snapshot, second, snapshot):
+            Snapshot.objects.filter(pk=heartbeat.pk).update(modified_at=timezone.now())
+            assert displayed_order() == expected
+
+    def test_live_progress_merges_process_rows_with_archiveresults_when_present(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_snapshot_hook_projection,
+        real_second_snapshot_hook_process,
+    ):
+        import os
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Process
+
+        machine_models._CURRENT_MACHINE = None
+        _, result = real_snapshot_hook_projection
+        process = real_second_snapshot_hook_process
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = os.getpid()
+        process.exit_code = None
+        process.started_at = timezone.now()
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "exit_code", "started_at", "ended_at", "modified_at"])
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        payload = response.json()
+        active_crawl = next(crawl for crawl in payload["active_crawls"] if crawl["id"] == str(snapshot.crawl_id))
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.id))
+        sources = {item["source"] for item in active_snapshot["all_plugins"]}
+        plugins = {item["plugin"] for item in active_snapshot["all_plugins"]}
+        assert sources == {"archiveresult", "process"}
+        assert result.plugin in plugins
+        assert "parse_txt_urls" in plugins
+
+    def test_live_progress_reports_hook_durations_for_badge_widths(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_snapshot_hook_projection,
+        real_second_snapshot_hook_process,
+    ):
+        import os
+        from datetime import timedelta
+
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Process
+
+        # The live UI sizes each hook badge by its duration: finished hooks
+        # need their real run span, running ones their start to grow from.
+        machine_models._CURRENT_MACHINE = None
+        _, result = real_snapshot_hook_projection
+        result.refresh_from_db()
+        assert result.start_ts is not None and result.end_ts is not None
+        process = real_second_snapshot_hook_process
+        running_started_at = timezone.now() - timedelta(seconds=42)
+        # The capture began before its longest-running hook did.
+        type(snapshot).objects.filter(pk=snapshot.pk).update(created_at=running_started_at - timedelta(minutes=1))
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = os.getpid()
+        process.exit_code = None
+        process.started_at = running_started_at
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "exit_code", "started_at", "ended_at", "modified_at"])
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        active_crawl = next(crawl for crawl in response.json()["active_crawls"] if crawl["id"] == str(snapshot.crawl_id))
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.id))
+        finished = next(item for item in active_snapshot["all_plugins"] if item["id"] == str(result.id))
+        running = next(item for item in active_snapshot["all_plugins"] if item["source"] == "process")
+        assert finished["status"] == result.status
+        assert finished["elapsed"] == round((result.end_ts - result.start_ts).total_seconds(), 1)
+        assert "started_at" not in finished
+        assert running["status"] == "started"
+        assert running["started_at"] == running_started_at.isoformat()
+        assert "elapsed" not in running
+
+    def test_live_progress_hook_labels_omit_run_mode_markers(self):
+        import abx_plugins.plugins
+
+        from archivebox.progressmonitor.views import _hook_details
+
+        # Badge labels name the hook; .finite/.daemon/.bg only say how it runs.
+        plugins_dir = files(abx_plugins.plugins)
+        hook_names = sorted(
+            hook.name
+            for plugin_dir in plugins_dir.iterdir()
+            if plugin_dir.is_dir()
+            for hook in plugin_dir.iterdir()
+            if hook.name.startswith("on_") and any(marker in hook.name for marker in (".finite.", ".daemon.", ".bg."))
+        )
+        assert "on_Snapshot__01_chrome_tab.daemon.bg.js" in hook_names
+        labels = {name: _hook_details(name, plugin="hook")[1] for name in hook_names}
+        assert labels["on_Snapshot__01_chrome_tab.daemon.bg.js"] == "chrome tab"
+        assert labels["on_Snapshot__00_archivedotorg.finite.bg.py"] == "archivedotorg"
+        assert [label for label in labels.values() if any(marker in label for marker in ("finite", "daemon", ".bg"))] == []
+
+    def test_live_progress_hook_badges_keep_their_cells_and_only_grow(
+        self,
+        snapshot,
+        live_server,
+        browser_runtime,
+        real_second_snapshot_hook_process,
+    ):
+        import os
+        from datetime import timedelta
+        from urllib.parse import urlsplit
+
+        from playwright.sync_api import sync_playwright
+
+        import archivebox.machine.models as machine_models
+        from archivebox.core.models import ArchiveResult
+        from archivebox.machine.models import Machine, Process
+
+        machine_models._CURRENT_MACHINE = None
+        port = urlsplit(live_server.url).port
+        machine = Machine.current()
+        machine.config = {**machine.config, "BASE_URL": f"http://archivebox.localhost:{port}"}
+        machine.save(update_fields=["config"])
+        started_at = timezone.now() - timedelta(seconds=10)
+        from archivebox.workers.models import ACTIVE_STATE_LEASE_SECONDS
+
+        # The capture remains owned between hooks. Without a live lease, the
+        # last hook's exit correctly moves this row to the interrupted queue.
+        type(snapshot).objects.filter(pk=snapshot.pk).update(
+            permissions="public",
+            created_at=started_at - timedelta(minutes=1),
+            retry_at=timezone.now() + timedelta(seconds=ACTIVE_STATE_LEASE_SECONDS),
+        )
+        process = real_second_snapshot_hook_process
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = os.getpid()
+        process.exit_code = None
+        process.started_at = started_at
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "exit_code", "started_at", "ended_at", "modified_at"])
+        # The runner's ProcessStartedEvent projection: a started row for the hook.
+        result = ArchiveResult.objects.create(
+            snapshot=snapshot,
+            plugin="parse_txt_urls",
+            hook_name="on_Snapshot__71_parse_txt_urls.py",
+            status=ArchiveResult.StatusChoices.STARTED,
+            start_ts=started_at,
+            process=process,
+        )
+        Path(snapshot.output_dir).mkdir(parents=True, exist_ok=True)
+
+        def outside_event_loop(write):
+            # Sync Playwright runs an event loop on this thread and Django
+            # refuses ORM calls there, so make the real DB writes from another.
+            errors = []
+
+            def run():
+                try:
+                    write()
+                except BaseException as err:
+                    errors.append(err)
+
+            writer = Thread(target=run)
+            writer.start()
+            writer.join()
+            assert errors == []
+
+        # Every frame, record each badge's cell (layout box within its list) and
+        # its rendered duration bar, keyed by label, so animated transitions and
+        # instant re-renders are both observed. A badge must keep its cell and
+        # its bar must never shrink.
+        record_badges = """
+            window.badgeProblems = [];
+            const seen = new Map();
+            const sample = () => {
+                document.querySelectorAll('#progress-monitor .extractor-badge').forEach((badge) => {
+                    const label = badge.querySelector('.badge-label')?.textContent || '';
+                    const list = badge.closest('.extractor-list');
+                    const cell = {x: badge.offsetLeft - list.offsetLeft, y: badge.offsetTop - list.offsetTop, w: badge.offsetWidth};
+                    const bar = badge.querySelector('.badge-bar').getBoundingClientRect().width;
+                    const prev = seen.get(label);
+                    if (prev && (prev.x !== cell.x || prev.y !== cell.y || prev.w !== cell.w)) {
+                        window.badgeProblems.push(`${label} moved: ${JSON.stringify(prev.cell)} -> ${JSON.stringify(cell)}`);
+                    }
+                    if (prev && bar < prev.bar - 0.5) window.badgeProblems.push(`${label} bar shrank: ${prev.bar}px -> ${bar}px`);
+                    seen.set(label, {...cell, cell, bar: Math.max(bar, prev ? prev.bar : 0)});
+                });
+                requestAnimationFrame(sample);
+            };
+            requestAnimationFrame(sample);
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(browser_runtime["chrome_binary"]),
+                args=["--host-resolver-rules=MAP *.archivebox.localhost 127.0.0.1"],
+            )
+            page = browser.new_page()
+            page.goto(f"http://web.archivebox.localhost:{port}{snapshot.get_absolute_url()}")
+            running = page.locator("#progress-monitor .extractor-badge.started")
+            running.wait_for()
+            page.evaluate(record_badges)
+            page.wait_for_timeout(1500)
+
+            # A newly queued hook sorts alphabetically before the running one; it
+            # is appended after it instead of displacing the running hook's cell.
+            outside_event_loop(
+                lambda: ArchiveResult.objects.create(
+                    snapshot=snapshot,
+                    plugin="chrome",
+                    hook_name="on_Snapshot__11_chrome_wait",
+                    status=ArchiveResult.StatusChoices.QUEUED,
+                ),
+            )
+            page.locator("#progress-monitor .extractor-badge.queued").wait_for()
+            page.wait_for_timeout(1500)
+            labels = page.locator("#progress-monitor .extractor-badge .badge-label").all_text_contents()
+            assert labels == ["parse txt urls", "chrome wait"]
+
+            # The completion is recorded after the hook already exited, as it is
+            # when the bus event lands after the browser's last extrapolation.
+            process.status = Process.StatusChoices.EXITED
+            process.exit_code = 0
+            process.ended_at = timezone.now() - timedelta(seconds=3)
+            result.status = ArchiveResult.StatusChoices.SUCCEEDED
+            result.end_ts = process.ended_at
+
+            def finish():
+                process.save(update_fields=["status", "exit_code", "ended_at", "modified_at"])
+                result.save(update_fields=["status", "end_ts", "modified_at"])
+
+            outside_event_loop(finish)
+            page.locator("#progress-monitor .extractor-badge.succeeded").wait_for()
+            page.wait_for_timeout(1500)
+
+            assert page.evaluate("window.badgeProblems") == []
+            browser.close()
+
+    def test_live_progress_omits_pid_for_exited_process_rows(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_second_snapshot_hook_process,
+    ):
+        import archivebox.machine.models as machine_models
+        from archivebox.machine.models import Process
+
+        machine_models._CURRENT_MACHINE = None
+        process = real_second_snapshot_hook_process
+        assert process.status == Process.StatusChoices.EXITED
+        assert process.exit_code == 0
+        type(snapshot).objects.filter(pk=snapshot.pk).update(downloaded_at=process.started_at + timezone.timedelta(seconds=1))
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+
+        assert response.status_code == 200
+        payload = response.json()
+        active_crawl = next(crawl for crawl in payload["active_crawls"] if crawl["id"] == str(snapshot.crawl_id))
+        active_snapshot = next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.id))
+        process_entry = next(item for item in active_snapshot["all_plugins"] if item["source"] == "process")
+        assert process_entry["status"] == "succeeded"
+        assert "pid" not in process_entry
+
+    def test_live_progress_times_current_attempt_and_shows_interrupted_capture_waiting(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_snapshot_hook_projection,
+    ):
+        import os
+        from datetime import timedelta
+
+        import archivebox.machine.models as machine_models
+        from archivebox.core.models import ArchiveResult
+        from archivebox.machine.models import Process
+
+        # Cabbage showed captures interrupted by a restart as running for
+        # "59h+": the timer counted from Snapshot.created_at because
+        # downloaded_at is only set when a capture completes.
+        process, _result = real_snapshot_hook_projection
+        machine_models._CURRENT_MACHINE = process.machine
+        now = timezone.now()
+        type(snapshot).objects.filter(pk=snapshot.pk).update(created_at=now - timedelta(hours=59), retry_at=now - timedelta(hours=1))
+        assert process.status == Process.StatusChoices.EXITED
+        # A hook the interrupted attempt left mid-run; the restart reruns it.
+        superseded = ArchiveResult.objects.create(
+            snapshot=snapshot,
+            plugin="title",
+            hook_name="on_Snapshot__54_title",
+            status=ArchiveResult.StatusChoices.STARTED,
+            start_ts=now - timedelta(hours=2),
+        )
+
+        def displayed_snapshot():
+            response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+            assert response.status_code == 200, response.content
+            active_crawl = next(crawl for crawl in response.json()["active_crawls"] if crawl["id"] == str(snapshot.crawl_id))
+            return next(item for item in active_crawl["active_snapshots"] if item["id"] == str(snapshot.id))
+
+        client.force_login(admin_user)
+        interrupted = displayed_snapshot()
+        assert interrupted["status"] == "started"
+        assert interrupted["worker_state"] == "interrupted"
+        assert interrupted["started"] is None
+        assert "worker_pid" not in interrupted
+
+        # The runner starts it over: lease renewed and a hook running again.
+        attempt_started_at = now - timedelta(minutes=5)
+        type(snapshot).objects.filter(pk=snapshot.pk).update(retry_at=now + timedelta(seconds=60))
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = os.getpid()
+        process.exit_code = None
+        process.started_at = attempt_started_at
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "exit_code", "started_at", "ended_at", "modified_at"])
+
+        resumed = displayed_snapshot()
+        assert resumed["worker_state"] == "running"
+        assert resumed["worker_pid"] == os.getpid()
+        assert resumed["started"] == attempt_started_at.isoformat()
+        assert str(superseded.id) not in {item["id"] for item in resumed["all_plugins"]}
+
+
+def _progress_snapshot_id(item) -> str:
+    # Queued rows are compact [id, url, title?] lists; detailed rows are dicts.
+    return item[0] if isinstance(item, list) else item["id"]
+
+
+class TestLiveProgressDisplayWindow:
+    def test_live_progress_shows_three_crawls_started_then_paused_then_queued(self, client, admin_user):
+        from datetime import timedelta
+        from django.contrib.auth import get_user_model
+        from archivebox.crawls.models import Crawl
+
+        now = timezone.now()
+        other_user = get_user_model().objects.create_user(username="other-window-owner")
+
+        def make_crawl(name, status, age_minutes, owner=admin_user, created_at=None):
+            crawl = Crawl.objects.create(urls=f"https://example.com/{name}", created_by=owner)
+            Crawl.objects.filter(pk=crawl.pk).update(
+                status=status,
+                modified_at=now - timedelta(minutes=age_minutes),
+                created_at=created_at or now - timedelta(minutes=age_minutes),
+                retry_at=None,
+            )
+            return str(crawl.pk)
+
+        started = [make_crawl(f"started-{i}", Crawl.StatusChoices.STARTED, i + 1) for i in range(2)]
+        paused = [make_crawl(f"paused-{i}", Crawl.StatusChoices.PAUSED, 10 + i) for i in range(3)]
+        # Paused more than 12h ago with no runnable work: not part of the window.
+        stale_paused = make_crawl("paused-stale", Crawl.StatusChoices.PAUSED, 3 * 24 * 60)
+        queued = [make_crawl(f"queued-{i}", Crawl.StatusChoices.QUEUED, 20 + i) for i in range(4)]
+        other_started = make_crawl("other-started", Crawl.StatusChoices.STARTED, 0, owner=other_user)
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+        assert response.status_code == 200, response.content
+        payload = response.json()
+        # Superuser: newest started crawl overall is the other user's crawl.
+        assert [crawl["id"] for crawl in payload["active_crawls"]] == [other_started, *started]
+        assert [crawl["status"] for crawl in payload["active_crawls"]] == [Crawl.StatusChoices.STARTED] * 3
+        assert payload["crawls_active"] == 3
+        assert payload["crawls_queued"] == 4
+        assert payload["hidden_crawls"] == [
+            {"status": "paused", "count": 3, "url": "/admin/crawls/crawl/?status__exact=paused"},
+            {"status": "queued", "count": 4, "url": "/admin/crawls/crawl/?status__exact=queued"},
+        ]
+        # The "more" links are real admin filters returning the same status rows.
+        expected_admin_rows = {
+            "paused": {*paused, stale_paused},
+            "queued": set(queued),
+        }
+        for hidden in payload["hidden_crawls"]:
+            admin_response = client.get(hidden["url"], HTTP_HOST=ADMIN_TEST_HOST)
+            assert admin_response.status_code == 200
+            changelist = admin_response.context["cl"]
+            assert {str(row.pk) for row in changelist.result_list} == expected_admin_rows[hidden["status"]]
+            assert changelist.result_count == len(expected_admin_rows[hidden["status"]])
+
+        # Free two started slots: paused (newest first) fill before queued.
+        Crawl.objects.filter(pk__in=[other_started, started[1]]).update(status=Crawl.StatusChoices.SEALED)
+        payload = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST).json()
+        assert [crawl["id"] for crawl in payload["active_crawls"]] == [started[0], paused[0], paused[1]]
+        assert [crawl["status"] for crawl in payload["active_crawls"]] == ["started", "paused", "paused"]
+        assert payload["hidden_crawls"] == [
+            {"status": "paused", "count": 1, "url": "/admin/crawls/crawl/?status__exact=paused"},
+            {"status": "queued", "count": 4, "url": "/admin/crawls/crawl/?status__exact=queued"},
+        ]
+
+        # No started/paused work: queued crawls fill the window, oldest-modified hidden.
+        Crawl.objects.filter(pk__in=[started[0], *paused, stale_paused]).update(status=Crawl.StatusChoices.SEALED)
+        payload = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST).json()
+        assert [crawl["id"] for crawl in payload["active_crawls"]] == queued[:3]
+        assert payload["hidden_crawls"] == [
+            {"status": "queued", "count": 1, "url": "/admin/crawls/crawl/?status__exact=queued"},
+        ]
+
+        # Nothing truncated: no "more" links at all.
+        Crawl.objects.filter(pk=queued[3]).update(status=Crawl.StatusChoices.SEALED)
+        payload = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST).json()
+        assert [crawl["id"] for crawl in payload["active_crawls"]] == queued[:3]
+        assert payload["hidden_crawls"] == []
+
+    def test_live_progress_hidden_crawl_links_are_scoped_to_staff_owner(self, client, admin_user):
+        from django.contrib.auth import get_user_model
+        from archivebox.crawls.models import Crawl
+
+        admin_user.is_superuser = False
+        admin_user.save(update_fields=["is_superuser"])
+        other_user = get_user_model().objects.create_user(username="other-hidden-owner")
+        own = []
+        for i in range(5):
+            crawl = Crawl.objects.create(urls=f"https://example.com/own-{i}", created_by=admin_user)
+            own.append(str(crawl.pk))
+        Crawl.objects.filter(pk__in=own).update(status=Crawl.StatusChoices.STARTED)
+        for i in range(4):
+            crawl = Crawl.objects.create(urls=f"https://example.com/other-{i}", created_by=other_user)
+            Crawl.objects.filter(pk=crawl.pk).update(status=Crawl.StatusChoices.STARTED)
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+        assert response.status_code == 200, response.content
+        payload = response.json()
+        assert payload["crawls_active"] == 5
+        assert len(payload["active_crawls"]) == 3
+        assert {crawl["id"] for crawl in payload["active_crawls"]} <= set(own)
+        assert payload["hidden_crawls"] == [
+            {
+                "status": "started",
+                "count": 2,
+                "url": f"/admin/crawls/crawl/?status__exact=started&created_by__id__exact={admin_user.pk}",
+            },
+        ]
+
+    def test_live_progress_shares_twenty_snapshot_budget_started_first(self, client, admin_user):
+        from datetime import timedelta
+        from archivebox.core.models import Snapshot
+        from archivebox.crawls.models import Crawl
+
+        now = timezone.now()
+        newer = Crawl.objects.create(urls="https://example.com/newer", created_by=admin_user)
+        older = Crawl.objects.create(urls="https://example.com/older", created_by=admin_user)
+        Crawl.objects.filter(pk=newer.pk).update(status=Crawl.StatusChoices.STARTED, modified_at=now)
+        Crawl.objects.filter(pk=older.pk).update(status=Crawl.StatusChoices.STARTED, modified_at=now - timedelta(minutes=5))
+
+        layout = {
+            newer: {Snapshot.StatusChoices.STARTED: 15, Snapshot.StatusChoices.QUEUED: 5, Snapshot.StatusChoices.SEALED: 2},
+            older: {Snapshot.StatusChoices.STARTED: 8, Snapshot.StatusChoices.QUEUED: 4},
+        }
+        index = 0
+        for crawl, counts in layout.items():
+            rows = []
+            for status, count in counts.items():
+                for _ in range(count):
+                    index += 1
+                    rows.append(
+                        Snapshot(
+                            crawl=crawl,
+                            url=f"https://example.com/{crawl.pk}/{status}/{index}",
+                            timestamp=str(now.timestamp() + index),
+                            status=status,
+                        ),
+                    )
+            Snapshot.objects.bulk_create(rows)
+            # Distinct modified_at per row so the started/queued orders are stable.
+            for offset, snapshot_id in enumerate(Snapshot.objects.filter(crawl=crawl).order_by("timestamp").values_list("id", flat=True)):
+                Snapshot.objects.filter(pk=snapshot_id).update(modified_at=now - timedelta(seconds=offset))
+
+        client.force_login(admin_user)
+        response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+        assert response.status_code == 200, response.content
+        payload = response.json()
+        crawls = {crawl["id"]: crawl for crawl in payload["active_crawls"]}
+        assert list(crawls) == [str(newer.pk), str(older.pk)]
+
+        def displayed(crawl, status):
+            return [
+                _progress_snapshot_id(item)
+                for item in crawls[str(crawl.pk)]["active_snapshots"]
+                if _progress_snapshot_id(item)
+                in {str(pk).replace("-", "") for pk in Snapshot.objects.filter(crawl=crawl, status=status).values_list("id", flat=True)}
+            ]
+
+        total_displayed = sum(len(crawl["active_snapshots"]) for crawl in crawls.values())
+        assert total_displayed == 20
+        # Started rows from both crawls are allocated before any queued row.
+        assert len(displayed(newer, Snapshot.StatusChoices.STARTED)) == 15
+        assert len(displayed(older, Snapshot.StatusChoices.STARTED)) == 5
+        assert displayed(newer, Snapshot.StatusChoices.QUEUED) == []
+        assert displayed(older, Snapshot.StatusChoices.QUEUED) == []
+        newest_older_started = [
+            str(pk).replace("-", "")
+            for pk in Snapshot.objects.filter(crawl=older, status=Snapshot.StatusChoices.STARTED)
+            .order_by("-modified_at")
+            .values_list("id", flat=True)[:5]
+        ]
+        assert sorted(displayed(older, Snapshot.StatusChoices.STARTED)) == sorted(newest_older_started)
+
+        def hidden_url(crawl, status):
+            return f"/admin/core/snapshot/?crawl_id__exact={str(crawl.pk).replace('-', '')}&snapshot_status={status}"
+
+        assert crawls[str(newer.pk)]["hidden_snapshots"] == [
+            {"status": "queued", "count": 5, "url": hidden_url(newer, "queued")},
+        ]
+        assert crawls[str(older.pk)]["hidden_snapshots"] == [
+            {"status": "started", "count": 3, "url": hidden_url(older, "started")},
+            {"status": "queued", "count": 4, "url": hidden_url(older, "queued")},
+        ]
+        for crawl, counts in layout.items():
+            for hidden in crawls[str(crawl.pk)]["hidden_snapshots"]:
+                shown = len(displayed(crawl, hidden["status"]))
+                assert shown + hidden["count"] == counts[hidden["status"]]
+                admin_response = client.get(hidden["url"], HTTP_HOST=ADMIN_TEST_HOST)
+                assert admin_response.status_code == 200
+                changelist = admin_response.context["cl"]
+                assert changelist.result_count == counts[hidden["status"]]
+                assert {row.pk for row in changelist.result_list} == set(
+                    Snapshot.objects.filter(crawl=crawl, status=hidden["status"]).values_list("id", flat=True),
+                )
+
+        # Once started rows fit, the remaining budget flows to queued rows.
+        Snapshot.objects.filter(crawl=newer, status=Snapshot.StatusChoices.STARTED).update(status=Snapshot.StatusChoices.SEALED)
+        payload = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST).json()
+        crawls = {crawl["id"]: crawl for crawl in payload["active_crawls"]}
+        assert len(displayed(older, Snapshot.StatusChoices.STARTED)) == 8
+        assert len(displayed(newer, Snapshot.StatusChoices.QUEUED)) == 5
+        assert len(displayed(older, Snapshot.StatusChoices.QUEUED)) == 4
+        assert sum(len(crawl["active_snapshots"]) for crawl in crawls.values()) == 17
+        assert crawls[str(newer.pk)]["hidden_snapshots"] == []
+        assert crawls[str(older.pk)]["hidden_snapshots"] == []
+
+    def test_live_progress_header_only_poll_counts_workers_outside_window(
+        self,
+        client,
+        admin_user,
+        snapshot,
+        real_snapshot_hook_projection,
+    ):
+        from datetime import timedelta
+
+        import archivebox.machine.models as machine_models
+        from archivebox.crawls.models import Crawl
+        from archivebox.machine.models import Process
+
+        process, result = real_snapshot_hook_projection
+        machine_models._CURRENT_MACHINE = process.machine
+        result.delete()
+        process.status = Process.StatusChoices.RUNNING
+        process.pid = os.getpid()
+        process.ended_at = None
+        process.save(update_fields=["status", "pid", "ended_at", "modified_at"])
+
+        now = timezone.now()
+        Crawl.objects.filter(pk=snapshot.crawl_id).update(status=Crawl.StatusChoices.STARTED, modified_at=now - timedelta(hours=1))
+        newer_crawls = []
+        for i in range(3):
+            crawl = Crawl.objects.create(urls=f"https://example.com/newer-{i}", created_by=admin_user)
+            Crawl.objects.filter(pk=crawl.pk).update(status=Crawl.StatusChoices.STARTED, modified_at=now - timedelta(minutes=i))
+            newer_crawls.append(str(crawl.pk))
+        Crawl.objects.create(urls="https://example.com/queued", created_by=admin_user)
+
+        client.force_login(admin_user)
+        full_response = client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST)
+        assert full_response.status_code == 200, full_response.content
+        full = full_response.json()
+        assert [crawl["id"] for crawl in full["active_crawls"]] == newer_crawls
+        assert str(snapshot.crawl_id) not in {crawl["id"] for crawl in full["active_crawls"]}
+        assert full["hidden_crawls"] == [
+            {"status": "started", "count": 1, "url": "/admin/crawls/crawl/?status__exact=started"},
+            {"status": "queued", "count": 1, "url": "/admin/crawls/crawl/?status__exact=queued"},
+        ]
+        assert full["crawls_active"] == 4
+        assert full["crawls_queued"] == 1
+        assert full["snapshots_active"] == 1
+        # The running hook belongs to a started snapshot outside the window.
+        assert full["total_workers"] == 1
+
+        header_response = client.get(reverse("live_progress"), {"tree": "0"}, HTTP_HOST=ADMIN_TEST_HOST)
+        assert header_response.status_code == 200, header_response.content
+        header = header_response.json()
+        assert "active_crawls" not in header
+        assert "hidden_crawls" not in header
+        assert header["total_workers"] == 1
+        tree_keys = {"active_crawls", "hidden_crawls", "server_time"}
+        assert {key: value for key, value in header.items() if key != "server_time"} == {
+            key: value for key, value in full.items() if key not in tree_keys
+        }
+
+        # Once the hook exits, both poll shapes drop the worker.
+        Process.objects.filter(pk=process.pk).update(status=Process.StatusChoices.EXITED, ended_at=timezone.now())
+        assert client.get(reverse("live_progress"), {"tree": "0"}, HTTP_HOST=ADMIN_TEST_HOST).json()["total_workers"] == 0
+        assert client.get(reverse("live_progress"), HTTP_HOST=ADMIN_TEST_HOST).json()["total_workers"] == 0

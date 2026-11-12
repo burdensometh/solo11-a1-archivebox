@@ -1,0 +1,254 @@
+"""Shared foreground signal and child-process cleanup contracts.
+
+Shutdown intent and process exit are separate: takeover must preserve the
+replacement owner's work, while a user abort must not later resume the crawl.
+Callers own that policy; this module preserves the received signal and stops
+only the process objects they explicitly supply.
+
+Cooperative boundaries are essential, not just quieter exception handling.
+A real Linux CI regression interrupted Popen.poll() with SIGINT and stranded
+its wait lock. SIGKILL stopped the child (it became a zombie), but Popen.wait()
+still timed out. Raising a different exception or waiting longer cannot repair
+that interrupted critical section. Polling loops must record the signal first
+and honor it between operations; async owners may cancel their own task while
+their loop is running. Once exiting, the last-resort process cleanup must stay
+synchronous: the original loop may be closed, and creating a replacement loop
+cannot recover tasks or resources owned by it.
+
+Keep immediate signal notices and repeated-signal force exit independent of
+the event bus: it may already be draining or closed during shutdown. Resumable
+pause/retry/skip belongs to the existing crawl controller and must not set
+sticky command-shutdown state. See foreground_shutdown_signals below for both
+cooperative and legacy blocking callers; do not change all callers' policy at
+once without supplying their interruption boundaries.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+import psutil
+
+
+@dataclass
+class ShutdownSignalState:
+    """Tracks the exact OS signal that asked a foreground command to exit."""
+
+    signal_name: str | None = None
+
+
+_active_shutdown_state: ShutdownSignalState | None = None
+
+
+def raise_if_shutdown_requested() -> None:
+    """Honor sticky shutdown intent at a caller-owned interruption boundary."""
+
+    if _active_shutdown_state and _active_shutdown_state.signal_name:
+        raise KeyboardInterrupt
+
+
+def configured_stopwaitsecs(workers: list[dict[str, str]] | tuple[dict[str, str], ...], *, default: int = 5, buffer: int = 5) -> int:
+    """Return a deterministic shutdown bound from generated worker definitions."""
+
+    stop_grace_seconds = default
+    for worker in workers:
+        try:
+            stop_grace_seconds = max(stop_grace_seconds, int(worker.get("stopwaitsecs") or default) + buffer)
+        except (TypeError, ValueError):
+            continue
+    return stop_grace_seconds
+
+
+def wait_popen_and_kill_children(
+    proc: subprocess.Popen,
+    children: list[psutil.Process],
+    *,
+    timeout: float,
+    kill_timeout: float = 2.0,
+) -> None:
+    """Reap our own Popen child and stop its explicitly captured descendants.
+
+    A dead child still needs its parent to reap it. Keep wait failures visible;
+    bypassing Popen's lock would hide the interrupted-owner bug described above.
+    Descendants must still be cleaned up when that wait fails.
+    """
+
+    try:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=kill_timeout)
+    except subprocess.TimeoutExpired as err:
+        try:
+            state = psutil.Process(proc.pid).as_dict(attrs=["pid", "ppid", "status", "num_threads", "cpu_times"])
+        except psutil.NoSuchProcess:
+            state = {"pid": proc.pid, "status": "exited"}
+        err.add_note(f"Process state after SIGKILL: {state}")
+        # A locked Popen wait can time out even after the OS process exits.
+        # Inspect CPython's lock only for diagnostics; never release it here.
+        waitpid_lock = getattr(proc, "_waitpid_lock", None)
+        err.add_note(
+            f"Popen state: returncode={proc.returncode}, "
+            f"waitpid_lock_locked={waitpid_lock.locked() if waitpid_lock is not None else None}, "
+            f"threads={[thread.name for thread in threading.enumerate()]}",
+        )
+        raise
+    finally:
+        # A parent that cannot be reaped must not leave its descendants running.
+        kill_remaining_processes(children, timeout=kill_timeout)
+
+
+def wait_psutil_and_kill_children(
+    proc: psutil.Process,
+    children: list[psutil.Process],
+    *,
+    timeout: float,
+    kill_timeout: float = 2.0,
+) -> None:
+    """Wait for a psutil parent and then hard-kill any surviving descendants."""
+
+    try:
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            # Another ArchiveBox foreground parent owns this Popen and must reap
+            # it. By the time supervisord is a zombie it has already stopped
+            # accepting work, so the caller can clear stale pid/socket files
+            # without blocking for a process it cannot reap itself.
+            kill_remaining_processes(children, timeout=kill_timeout)
+            return
+        proc.wait(timeout=timeout)
+    except psutil.TimeoutExpired:
+        proc.kill()
+    kill_remaining_processes(children, timeout=kill_timeout)
+    try:
+        proc.wait(timeout=kill_timeout)
+    except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+        pass
+
+
+def kill_remaining_processes(processes: list[psutil.Process], *, timeout: float = 2.0) -> None:
+    _gone, alive = psutil.wait_procs(processes, timeout=timeout)
+    for process in alive:
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(alive, timeout=timeout)
+
+
+@contextmanager
+def foreground_shutdown_signals(
+    handled_signals: tuple[signal.Signals, ...] = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM),
+    *,
+    first_signal_message: str | None = "\n[🛑] Got {signal_name}, stopping gracefully...\n",
+    on_signal: Callable[[signal.Signals], None] | None = None,
+    interrupt_handlers: dict[signal.Signals, Callable[[], None]] | None = None,
+    raise_on_first_signal: bool = True,
+) -> Iterator[ShutdownSignalState]:
+    """Keep shutdown intent visible until the owning foreground command unwinds.
+
+    Signal state was added because inner loops can swallow KeyboardInterrupt
+    while their caller still needs to stop its children. Cooperative callers use
+    raise_on_first_signal=False and check raise_if_shutdown_requested() between
+    operations, or cancel their owned async task through on_signal. Raising from
+    the handler can otherwise interrupt library locks or partially sent I/O.
+    Blocking callers without a cooperative boundary retain immediate exceptions.
+    """
+
+    global _active_shutdown_state
+
+    if threading.current_thread() is not threading.main_thread():
+        yield ShutdownSignalState()
+        return
+
+    state = ShutdownSignalState()
+    previous_active_state = _active_shutdown_state
+    previous_handlers = {sig: signal.getsignal(sig) for sig in (*handled_signals, *(interrupt_handlers or {}))}
+
+    def raise_keyboard_interrupt(signum, _frame):
+        sig = signal.Signals(signum)
+        if interrupt_handlers and sig in interrupt_handlers:
+            # Shield resumable terminal intent from sticky shutdown state.
+            # Ctrl+C is delegated to abx-dl's pause/abort controller; SIGUSR1/2
+            # carry prompt answers. Recording any of these as shutdown here
+            # makes a later skip/retry fail raise_if_shutdown_requested(), or
+            # makes a second Ctrl+C hard-exit before hooks can flush output.
+            # SIGTERM/SIGHUP deliberately bypass this shield: ownership takeover
+            # and parent loss must cancel the old worker without asking for input.
+            interrupt_handlers[sig]()
+            return
+        already_requested = state.signal_name is not None
+        if not already_requested:
+            state.signal_name = sig.name
+            if first_signal_message is not None:
+                os.write(sys.stdout.fileno(), first_signal_message.format(signal_name=state.signal_name).encode())
+        if on_signal is not None:
+            on_signal(sig)
+        # Actual shutdown requests remain sticky and a second signal forces
+        # exit. Resumable interactive actions were handled above without
+        # marking this context as shutting down.
+        if already_requested:
+            os.write(sys.stdout.fileno(), f"\n[🛑] Got {sig.name} again, exiting immediately.\n".encode())
+            os._exit(130)
+        if raise_on_first_signal:
+            raise KeyboardInterrupt
+
+    try:
+        _active_shutdown_state = state
+        for sig in previous_handlers:
+            signal.signal(sig, raise_keyboard_interrupt)
+        yield state
+    finally:
+        if state.signal_name and previous_active_state is not None and not previous_active_state.signal_name:
+            previous_active_state.signal_name = state.signal_name
+        _active_shutdown_state = previous_active_state
+        for sig, previous_handler in previous_handlers.items():
+            signal.signal(sig, previous_handler)
+
+
+@contextmanager
+def foreground_parent_watchdog(
+    *,
+    enabled: bool = True,
+    check_interval: float = 2.0,
+    shutdown_signal: signal.Signals = signal.SIGTERM,
+) -> Iterator[None]:
+    """Ask a foreground command to exit if its launcher/wrapper disappears.
+
+    `uv run archivebox ...` and similar wrappers can be killed without
+    delivering a signal to the real Python child. If that child keeps crawling
+    as an orphan, it can hold SQLite write locks long after the user-facing
+    command timed out. This watchdog is only for foreground command lifetimes;
+    daemon/supervisord workers should not use it because their parent may
+    intentionally hand them off.
+    """
+
+    original_ppid = os.getppid()
+    if not enabled or original_ppid <= 1:
+        yield
+        return
+
+    stopped = threading.Event()
+
+    def watch_parent() -> None:
+        while not stopped.wait(check_interval):
+            if os.getppid() == original_ppid:
+                continue
+            sys.stderr.write("\n[🛑] ArchiveBox parent process exited; stopping foreground command gracefully...\n")
+            sys.stderr.flush()
+            os.kill(os.getpid(), shutdown_signal)
+            return
+
+    thread = threading.Thread(target=watch_parent, name="archivebox-parent-watchdog", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()

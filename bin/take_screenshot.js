@@ -1,0 +1,520 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+const puppeteer = require('puppeteer');
+
+const DEFAULT_URL = 'http://web.archivebox.localhost:5797/add/';
+const DEFAULT_OUTPUT = 'tmp/add-page.png';
+
+function usage() {
+  console.log(`
+Usage:
+  node bin/take_screenshot.js [url] [output.png]
+
+Environment:
+  SESSIONID                  Django session cookie value for admin.archivebox.localhost
+  SCREENSHOT_COOKIE_NAME     Cookie name, defaults to sessionid
+  SCREENSHOT_COOKIE_DOMAIN   Cookie domain, defaults to admin.archivebox.localhost
+  SCREENSHOT_USER_DATA_DIR   Chrome profile directory (e.g. a persona's chrome_profile)
+  SCREENSHOT_LOGIN_USERNAME  Log in through #id_username before capture
+  SCREENSHOT_LOGIN_PASSWORD  Password used with SCREENSHOT_LOGIN_USERNAME
+  CHROME_BINARY              Chromium/Chrome executable path
+  SCREENSHOT_WIDTH           Viewport width, defaults to 1600
+  SCREENSHOT_HEIGHT          Viewport height, defaults to 1400
+  SCREENSHOT_VARIANTS_JSON   JSON array of {path,width,height} captures from one loaded page
+  SCREENSHOT_FULL_PAGE       Set to 1 to capture the full page, defaults to viewport only
+  SCREENSHOT_SCROLL_SELECTOR Scroll this selector into view before capture
+  SCREENSHOT_WAIT_SELECTOR   Wait for this selector before capture
+  SCREENSHOT_WAIT_FOR_TEXT   Wait for this visible page text before capture
+  SCREENSHOT_PREVIEW_WAIT_FOR_TEXT Wait for this text in the selected snapshot preview iframe
+  SCREENSHOT_REQUIRE_LIVE_PROGRESS  Require active snapshot progress and a nonblank decoded screencast within 60s
+  SCREENSHOT_CLICK_SELECTOR  Click this selector before capture
+  SCREENSHOT_AFTER_CLICK_WAIT_SELECTOR  Wait for this selector after clicking
+  SCREENSHOT_HOST_RESOLVER_RULES  Chrome host resolver rules
+  SCREENSHOT_SNAPSHOT_VIEW   Set to list or grid before loading the page
+  SCREENSHOT_SNAPSHOT_HEADER Set to expanded or collapsed before loading a snapshot detail page
+  SCREENSHOT_COLLAPSE_FILTERS Set to 1 to keep admin filters out of screenshots
+  SCREENSHOT_RESET_FILTERS   Set to 1 to clear the admin filter collapsed preference
+`);
+}
+
+function argValue(name) {
+  const idx = process.argv.indexOf(name);
+  return idx === -1 ? null : process.argv[idx + 1];
+}
+
+function firstPositionalArg(index) {
+  return process.argv.slice(2).filter((arg) => !arg.startsWith('--'))[index] || null;
+}
+
+function chromePath() {
+  const configured = process.env.CHROME_BINARY;
+  if (!configured || !path.isAbsolute(configured) || !fs.existsSync(configured)) {
+    throw new Error('CHROME_BINARY must be an absolute executable path resolved by abxpkg');
+  }
+  return configured;
+}
+
+function needsNoSandbox() {
+  return process.platform === 'linux' && !String(process.env.DISPLAY || '').trim();
+}
+
+function addLaunchArg(args, arg) {
+  if (!args.includes(arg)) args.push(arg);
+}
+
+async function waitForVisibleCardPreviews(page, timeout = 45000) {
+  // The page load event does not wait for nested lazy card images. Capture their
+  // decoded pixels, without forcing hidden alternatives or offscreen cards to load.
+  const cardHandles = await page.$$('iframe[title$=" card"]');
+  const visibleFrames = [];
+  for (const cardHandle of cardHandles) {
+    const visible = await cardHandle.evaluate((iframe) => {
+      const rect = iframe.getBoundingClientRect();
+      const style = getComputedStyle(iframe);
+      return rect.width > 0
+        && rect.height > 0
+        && rect.bottom > 0
+        && rect.right > 0
+        && rect.top < innerHeight
+        && rect.left < innerWidth
+        && style.visibility !== 'hidden'
+        && Number(style.opacity) > 0;
+    });
+    if (!visible) continue;
+
+    const expectedUrl = await cardHandle.evaluate((iframe) => iframe.src);
+    const frame = await cardHandle.contentFrame();
+    if (!frame) {
+      // Live card refreshes can detach an owner while its document is loading.
+      // Only detached owners cease to be required; a connected blank card is an error.
+      if (!await cardHandle.evaluate((iframe) => iframe.isConnected)) continue;
+      throw new Error(`Visible snapshot card iframe has no loaded document: ${new URL(expectedUrl).pathname}`);
+    }
+    visibleFrames.push({cardHandle, frame, expectedUrl});
+  }
+
+  await Promise.all(visibleFrames.map(async ({cardHandle, frame, expectedUrl}) => {
+    try {
+      await frame.waitForFunction(async (url) => {
+        if (location.href !== url || document.readyState !== 'complete') return false;
+        const images = [...document.images].filter((img) => {
+          const rect = img.getBoundingClientRect();
+          const style = getComputedStyle(img);
+          return rect.width > 0
+            && rect.height > 0
+            && rect.bottom > 0
+            && rect.right > 0
+            && rect.top < innerHeight
+            && rect.left < innerWidth
+            && style.display !== 'none'
+            && style.visibility !== 'hidden'
+            && Number(style.opacity) > 0;
+        });
+        if (!images.every((img) => img.complete && img.naturalWidth > 0)) return false;
+        await Promise.all(images.map((img) => img.decode()));
+        return true;
+      }, {timeout}, expectedUrl);
+    } catch (error) {
+      // Frame detachment is expected only when the page removed that actual iframe.
+      if (await cardHandle.evaluate((iframe) => iframe.isConnected)) throw error;
+    }
+  }));
+}
+
+async function liveProgressState(readyOnly = false, rejectedFrameUrl = '') {
+  const visible = (element, inViewport = true) => {
+    if (!element || !element.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) return false;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    if (!inViewport) return true;
+    const left = Math.max(0, rect.left);
+    const right = Math.min(innerWidth, rect.right);
+    const top = Math.max(0, rect.top);
+    const bottom = Math.min(innerHeight, rect.bottom);
+    return right > left && bottom > top
+      && element.contains(document.elementFromPoint((left + right) / 2, (top + bottom) / 2));
+  };
+  const monitor = document.querySelector('#progress-monitor[data-progress-scope="snapshot"]');
+  const panel = monitor?.querySelector('.screencast-panel.visible[data-mode="frame"]');
+  const img = panel?.querySelector('.screencast-frame img');
+  const src = img?.currentSrc || '';
+  const snapshotId = monitor
+    ? new URL(monitor.dataset.progressEndpoint, location.href).searchParams.get('snapshot_id')
+    : '';
+  const snapshot = [...(monitor?.querySelectorAll('.snapshot-item') || [])]
+    .find((item) => item.dataset.snapshotId?.replaceAll('-', '') === snapshotId?.replaceAll('-', ''));
+  const state = {
+    url: location.href,
+    title: document.title,
+    progressMonitorVisible: visible(monitor),
+    progressDetailsVisible: visible(monitor?.querySelector('.progress-content')),
+    snapshotId,
+    snapshotStarted: Boolean(snapshot?.querySelector('.status-badge.started')),
+    runningExtractors: [...(snapshot?.querySelectorAll('.extractor-badge.started') || [])]
+      .filter((element) => visible(element, false)).length,
+    screencastVisible: visible(panel) && visible(img),
+    screencastPlaceholderVisible: visible(monitor?.querySelector('.screencast-placeholder')),
+    screencastImageLoaded: Boolean(img?.complete && img.naturalWidth > 0 && img.naturalHeight > 0),
+    screencastImageSize: img ? `${img.naturalWidth}x${img.naturalHeight}` : '',
+    screencastImageUrl: src,
+  };
+  state.ready = state.progressMonitorVisible && state.progressDetailsVisible
+    && state.snapshotStarted && state.runningExtractors > 0
+    && state.screencastVisible && !state.screencastPlaceholderVisible && state.screencastImageLoaded
+    && /\/api\/v1\/core\/snapshot\/[^/]+\/screencast\.jpg$/.test(new URL(src || 'about:blank').pathname);
+  if (!readyOnly) return state;
+  if (!state.ready || src === rejectedFrameUrl) return false;
+  try {
+    await img.decode();
+  } catch {
+    return false;
+  }
+  return img.isConnected && img.currentSrc === src && visible(img) ? state : false;
+}
+
+async function waitForLiveProgress(page, deadline, screencastResponses) {
+  let rejectedFrameUrl = '';
+  try {
+    while (Date.now() < deadline) {
+      const handle = await page.waitForFunction(liveProgressState, {timeout: Math.max(1, deadline - Date.now()), polling: 100}, true, rejectedFrameUrl);
+      const state = await handle.jsonValue();
+      await handle.dispose();
+      // Chrome's initial frame can be a fully decoded, solid black/white image.
+      // Inspect the exact response displayed by the UI, without requesting a
+      // newer latest.jpg or bypassing its normal authentication/CORS behavior.
+      const response = screencastResponses.get(state.screencastImageUrl);
+      if (!response) throw new Error('Displayed screencast has no observed image response');
+      const imageData = `data:image/jpeg;base64,${(await response.buffer()).toString('base64')}`;
+      const hasContent = await page.evaluate(async (data) => {
+        const img = new Image();
+        img.src = data;
+        await img.decode();
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 64;
+        const context = canvas.getContext('2d');
+        // Ignore the outer edges: a site header alone can appear while the
+        // actual page is still blank. Marketing captures need page content.
+        context.drawImage(img, img.naturalWidth * 0.1, img.naturalHeight * 0.1,
+          img.naturalWidth * 0.8, img.naturalHeight * 0.8, 0, 0, 64, 64);
+        const pixels = context.getImageData(0, 0, 64, 64).data;
+        // Check each channel separately: a solid colored frame is also blank.
+        return [0, 1, 2].some((channel) => {
+          let min = 255;
+          let max = 0;
+          for (let i = channel; i < pixels.length; i += 4) {
+            min = Math.min(min, pixels[i]);
+            max = Math.max(max, pixels[i]);
+          }
+          return max - min > 16;
+        });
+      }, imageData);
+      if (hasContent) {
+        const current = await page.evaluate(liveProgressState);
+        if (current.ready && current.screencastImageUrl === state.screencastImageUrl) {
+          return {...current, screencastImageHasContent: true};
+        }
+      } else {
+        rejectedFrameUrl = state.screencastImageUrl;
+      }
+    }
+    throw new Error('Live progress deadline expired');
+  } catch (error) {
+    const state = await page.evaluate(liveProgressState).catch(() => ({url: page.url()}));
+    if (rejectedFrameUrl) state.rejectedBlankFrameUrl = rejectedFrameUrl;
+    throw new Error(`Live progress with a decoded screencast frame was not visible within 60 seconds: ${JSON.stringify(state)}`, {cause: error});
+  }
+}
+
+async function main() {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    usage();
+    return;
+  }
+
+  const url = argValue('--url') || firstPositionalArg(0) || DEFAULT_URL;
+  const output = path.resolve(argValue('--output') || firstPositionalArg(1) || DEFAULT_OUTPUT);
+  const width = Number(process.env.SCREENSHOT_WIDTH || 1600);
+  const height = Number(process.env.SCREENSHOT_HEIGHT || 1400);
+  const fullPage = process.env.SCREENSHOT_FULL_PAGE === '1';
+  const requireLiveProgress = process.env.SCREENSHOT_REQUIRE_LIVE_PROGRESS === '1';
+  // Include Chrome startup in the capture deadline. Starting a new 60s budget
+  // after launch lets cold/contended browser startup exceed the caller's total
+  // timeout before a missing screencast can produce its intended error.
+  const liveProgressDeadline = Date.now() + 60000;
+  const variants = process.env.SCREENSHOT_VARIANTS_JSON
+    ? JSON.parse(process.env.SCREENSHOT_VARIANTS_JSON)
+    : [];
+
+  if (!Array.isArray(variants)) {
+    throw new Error('SCREENSHOT_VARIANTS_JSON must be a JSON array');
+  }
+  for (const variant of variants) {
+    if (!variant.path || !Number.isInteger(variant.width) || !Number.isInteger(variant.height)) {
+      throw new Error('Each screenshot variant requires path, integer width, and integer height');
+    }
+  }
+
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+
+  const launchOptions = {
+    headless: true,
+    defaultViewport: { width, height },
+    executablePath: chromePath(),
+    args: [],
+  };
+  if (process.env.SCREENSHOT_USER_DATA_DIR) {
+    launchOptions.userDataDir = path.resolve(process.env.SCREENSHOT_USER_DATA_DIR);
+  }
+  if (process.env.SCREENSHOT_HOST_RESOLVER_RULES) {
+    addLaunchArg(launchOptions.args, `--host-resolver-rules=${process.env.SCREENSHOT_HOST_RESOLVER_RULES}`);
+  }
+  if (needsNoSandbox()) {
+    addLaunchArg(launchOptions.args, '--no-sandbox');
+    addLaunchArg(launchOptions.args, '--disable-setuid-sandbox');
+  }
+  const browser = await puppeteer.launch(launchOptions);
+  let page;
+  const documentRequests = new Map();
+  const pageErrors = [];
+  try {
+    // Persistent persona profiles can restore tabs left by earlier launches.
+    // Close them before navigating so repeated captures do not multiply live
+    // admin requests and overwhelm the server being documented.
+    const restoredPages = await browser.pages();
+    page = await browser.newPage();
+    page.on('error', (error) => pageErrors.push(error.name));
+    await page.setCacheEnabled(false);
+    await Promise.all(restoredPages.map((restoredPage) => restoredPage.close()));
+    page.setDefaultTimeout(45000);
+    const screencastResponses = new Map();
+    if (requireLiveProgress) {
+      page.on('response', (response) => {
+        if (/\/api\/v1\/core\/snapshot\/[^/]+\/screencast\.jpg$/.test(new URL(response.url()).pathname) && response.ok()) {
+          screencastResponses.set(response.url(), response);
+        }
+      });
+    }
+
+    const client = await page.createCDPSession();
+    await client.send('Network.enable');
+    client.on('Network.requestWillBeSent', (event) => {
+      if (event.type !== 'Document') return;
+      documentRequests.set(event.requestId, {
+        url: event.request.url,
+        requestTimestamp: event.timestamp,
+      });
+    });
+    client.on('Network.responseReceived', (event) => {
+      if (event.type !== 'Document') return;
+      const record = documentRequests.get(event.requestId);
+      if (!record) return;
+      record.responseTimestamp = event.timestamp;
+      record.status = event.response.status;
+      record.responseUrl = event.response.url;
+      if (Number.isFinite(record.requestTimestamp) && Number.isFinite(record.responseTimestamp)) {
+        record.ttfbMs = Math.round((record.responseTimestamp - record.requestTimestamp) * 1000);
+      }
+    });
+
+    if (process.env.SCREENSHOT_SNAPSHOT_VIEW || process.env.SCREENSHOT_SNAPSHOT_HEADER || process.env.SCREENSHOT_COLLAPSE_FILTERS === '1' || process.env.SCREENSHOT_RESET_FILTERS === '1') {
+      await page.evaluateOnNewDocument((snapshotView, snapshotHeader, collapseFilters, resetFilters) => {
+        if (snapshotView) localStorage.setItem('preferred_snapshot_view_mode', snapshotView);
+        if (snapshotHeader === 'expanded') localStorage.setItem('archivebox-snapshot-header-visible', 'true');
+        if (snapshotHeader === 'collapsed') localStorage.setItem('archivebox-snapshot-header-visible', 'false');
+        if (collapseFilters) localStorage.setItem('admin-filters-collapsed', 'true');
+        else if (resetFilters) localStorage.removeItem('admin-filters-collapsed');
+      }, process.env.SCREENSHOT_SNAPSHOT_VIEW || '', process.env.SCREENSHOT_SNAPSHOT_HEADER || '', process.env.SCREENSHOT_COLLAPSE_FILTERS === '1', process.env.SCREENSHOT_RESET_FILTERS === '1');
+    }
+
+    if (process.env.SESSIONID) {
+      const cookie = {
+        name: process.env.SCREENSHOT_COOKIE_NAME || 'sessionid',
+        value: process.env.SESSIONID,
+        path: '/',
+      };
+      if (process.env.SCREENSHOT_COOKIE_DOMAIN) {
+        cookie.domain = process.env.SCREENSHOT_COOKIE_DOMAIN;
+      } else {
+        cookie.url = new URL(url).origin;
+      }
+      await page.setCookie(cookie);
+    }
+
+    let navigationResponse = await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+
+    if (process.env.SCREENSHOT_LOGIN_USERNAME || process.env.SCREENSHOT_LOGIN_PASSWORD) {
+      if (!process.env.SCREENSHOT_LOGIN_USERNAME || !process.env.SCREENSHOT_LOGIN_PASSWORD) {
+        throw new Error('SCREENSHOT_LOGIN_USERNAME and SCREENSHOT_LOGIN_PASSWORD must be set together');
+      }
+      await page.waitForSelector('#id_username');
+      await page.type('#id_username', process.env.SCREENSHOT_LOGIN_USERNAME);
+      await page.type('#id_password', process.env.SCREENSHOT_LOGIN_PASSWORD);
+      const [loginResponse] = await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+        page.click('button[type="submit"], input[type="submit"]'),
+      ]);
+      navigationResponse = loginResponse || navigationResponse;
+      if (new URL(page.url()).pathname.includes('/admin/login/')) {
+        const loginError = await page.evaluate(() => Array.from(document.querySelectorAll('.errornote, .errorlist')).map((element) => element.textContent.trim()).filter(Boolean).join(' '));
+        const cookieDetails = (await page.cookies()).map((cookie) => `${cookie.name}@${cookie.domain}${cookie.path}${cookie.secure ? ';Secure' : ''}`).join(', ') || 'none';
+        throw new Error(`ArchiveBox persona login failed at ${page.url()}: ${loginError || 'no form error shown'} (cookies: ${cookieDetails})`);
+      }
+    }
+
+    await page.waitForSelector('body');
+    if (process.env.SCREENSHOT_WAIT_FOR_TEXT) {
+      await page.waitForFunction((text) => document.body.innerText.includes(text), {}, process.env.SCREENSHOT_WAIT_FOR_TEXT);
+    }
+    if (process.env.SCREENSHOT_WAIT_SELECTOR) {
+      await page.waitForSelector(process.env.SCREENSHOT_WAIT_SELECTOR, { timeout: 45000 });
+    }
+    if (process.env.SCREENSHOT_PREVIEW_WAIT_FOR_TEXT) {
+      const previewHandle = await page.waitForSelector('#main-frame', {timeout: 45000});
+      const preview = await previewHandle.contentFrame();
+      if (!preview) throw new Error('Snapshot preview iframe has no document');
+      await preview.waitForFunction(
+        (text) => document.body?.innerText.includes(text),
+        {timeout: 45000},
+        process.env.SCREENSHOT_PREVIEW_WAIT_FOR_TEXT,
+      );
+    }
+    if (process.env.SCREENSHOT_CLICK_SELECTOR) {
+      await page.waitForSelector(process.env.SCREENSHOT_CLICK_SELECTOR, { timeout: 45000 });
+      await page.click(process.env.SCREENSHOT_CLICK_SELECTOR);
+    }
+    if (process.env.SCREENSHOT_AFTER_CLICK_WAIT_SELECTOR) {
+      await page.waitForSelector(process.env.SCREENSHOT_AFTER_CLICK_WAIT_SELECTOR, { timeout: 45000 });
+    }
+
+
+    if (requireLiveProgress) {
+      await waitForLiveProgress(page, liveProgressDeadline, screencastResponses);
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+    }
+
+    // Selecting a hash opens its output stack after the saved header preference
+    // is read. Apply the requested collapse through the real toggle afterwards.
+    if (process.env.SCREENSHOT_SNAPSHOT_HEADER === 'collapsed') {
+      const toggle = await page.$('.header-toggle[aria-expanded="true"]');
+      if (toggle) await toggle.click();
+    }
+
+    const checks = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      progressMonitorDisplay: document.querySelector('#progress-monitor')
+        ? getComputedStyle(document.querySelector('#progress-monitor')).display
+        : 'missing',
+      progressCrawls: document.querySelectorAll('#progress-monitor .crawl-item').length,
+      progressSnapshots: document.querySelectorAll('#progress-monitor .snapshot-item').length,
+      screencastVisible: Boolean(document.querySelector('#progress-monitor .screencast-panel.visible')),
+      screencastPlaceholderVisible: Boolean(document.querySelector('#progress-monitor .screencast-panel.visible .screencast-placeholder')),
+      screencastImageLoaded: (() => {
+        const img = document.querySelector('#progress-monitor .screencast-panel.visible img');
+        return Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
+      })(),
+      screencastImageSize: (() => {
+        const img = document.querySelector('#progress-monitor .screencast-panel.visible img');
+        return img ? `${img.naturalWidth}x${img.naturalHeight}` : '';
+      })(),
+      addForm: Boolean(document.querySelector('#add-form')),
+      limitFields: Array.from(document.querySelectorAll('.crawl-limit-field label')).map((el) => el.textContent.trim()),
+      snapshotOutputPlugins: [...new Set(
+        [...document.querySelectorAll('.thumb-card[data-plugin-name] a[target="preview"]')]
+          .map((link) => link.closest('.thumb-card')?.dataset.pluginName)
+          .filter(Boolean),
+      )],
+      snapshotOutputs: [...document.querySelectorAll('.thumb-card[data-plugin-name]')]
+        .map((card) => ({
+          plugin: card.dataset.pluginName || '',
+          outputPath: card.dataset.outputPath || '',
+          previewUrl: card.dataset.previewUrl || card.querySelector('a[target="preview"]')?.getAttribute('href') || '',
+        }))
+        .filter((output) => output.plugin && output.previewUrl),
+      selectedSnapshotOutputPlugin: document.querySelector('.thumb-card.selected-card[data-plugin-name]')?.dataset.pluginName || '',
+    }));
+    checks.status = navigationResponse ? navigationResponse.status() : null;
+    checks.finalUrl = page.url();
+    const navigationUrl = navigationResponse?.url() || page.url();
+    const matchingDocumentRequests = [...documentRequests.values()]
+      .filter((record) => record.status === checks.status && Number.isFinite(record.ttfbMs))
+      .filter((record) => {
+        const responseUrl = record.responseUrl || record.url || '';
+        return responseUrl === navigationUrl || responseUrl === checks.finalUrl || responseUrl.split('#')[0] === checks.finalUrl.split('#')[0];
+      });
+    const timingRecord = matchingDocumentRequests.at(-1)
+      || [...documentRequests.values()].filter((record) => Number.isFinite(record.ttfbMs)).at(-1);
+    if (timingRecord) {
+      checks.ttfbMs = timingRecord.ttfbMs;
+    }
+
+    const screenshotPaths = [];
+    if (requireLiveProgress) checks.liveProgressCaptures = [];
+    const capture = async (screenshotPath) => {
+      // Resizing can move the target to a different row/column. Re-anchor each
+      // gallery variant so it photographs the requested controls at every width.
+      if (process.env.SCREENSHOT_SCROLL_SELECTOR) {
+        await page.waitForSelector(process.env.SCREENSHOT_SCROLL_SELECTOR, { timeout: 45000 }).catch(() => {});
+        await page.evaluate((selector) => {
+          document.querySelector(selector)?.scrollIntoView({ block: 'start', inline: 'nearest' });
+        }, process.env.SCREENSHOT_SCROLL_SELECTOR);
+      }
+      await waitForVisibleCardPreviews(page, requireLiveProgress ? Math.max(1, liveProgressDeadline - Date.now()) : 45000);
+      if (requireLiveProgress) {
+        const liveProgress = await waitForLiveProgress(page, liveProgressDeadline, screencastResponses);
+        checks.liveProgressCaptures.push({path: screenshotPath, viewport: page.viewport(), ...liveProgress});
+      }
+      await page.screenshot({path: screenshotPath, fullPage});
+      screenshotPaths.push(screenshotPath);
+    };
+    if (variants.length) {
+      for (const variant of variants) {
+        const variantPath = path.resolve(variant.path);
+        fs.mkdirSync(path.dirname(variantPath), { recursive: true });
+        await page.setViewport({width: variant.width, height: variant.height, deviceScaleFactor: 1});
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await capture(variantPath);
+      }
+    } else {
+      await capture(output);
+    }
+    console.log(JSON.stringify({ screenshotPath: screenshotPaths[0], screenshotPaths, checks }, null, 2));
+  } catch (error) {
+    if (process.env.SCREENSHOT_FAILURE_DIR) {
+      // CI removes provider data after failure. Retain only URL paths and native
+      // frame/request state, never persona data, request headers, or response bodies.
+      const safeUrl = (value) => {
+        try {
+          const parsed = new URL(value);
+          return ['http:', 'https:'].includes(parsed.protocol) ? `${parsed.origin}${parsed.pathname}` : parsed.protocol;
+        } catch { return ''; }
+      };
+      const failureDir = path.resolve(process.env.SCREENSHOT_FAILURE_DIR);
+      fs.mkdirSync(failureDir, {recursive: true});
+      fs.writeFileSync(path.join(failureDir, `${path.basename(output)}.json`), JSON.stringify({
+        error: error.name,
+        pageErrors,
+        url: safeUrl(page?.url()),
+        frames: page?.frames().map((frame) => ({url: safeUrl(frame.url()), detached: frame.detached})),
+        documents: [...documentRequests.values()].map((record) => ({
+          ...record, url: safeUrl(record.url), responseUrl: safeUrl(record.responseUrl),
+        })),
+      }, null, 2));
+    }
+    throw error;
+  } finally {
+    await browser.close();
+  }
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = {waitForVisibleCardPreviews};
